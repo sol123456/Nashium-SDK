@@ -17,7 +17,8 @@ from .formatting import (
     print_warning,
 )
 from .sample_bots import determinism_test_bot_sources, sample_leaderboard_bot_sources
-from ..core import InteractionResult, MatchConfig
+from .loading import load_bot_from_file
+from ..core import InteractionResult, MatchConfig, run_match
 
 
 
