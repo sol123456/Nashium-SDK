@@ -1,3 +1,6 @@
+I still need to add 1) saveoutput and 2) give context-> Your challenge:
+**guess whether your opponent will output a 1 or a 0.**
+
 # Nashium Python SDK
 
 Create and test your matching pennies bot for the Nashium competition.
