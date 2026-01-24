@@ -17,45 +17,46 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  nashium scaffold my_bot.py          Create a new bot from template
-  nashium qualify my_bot.py           Test against sample opponents  
-  nashium check my_bot.py             Verify your bot is deterministic
-  nashium run bot_a.py bot_b.py       Run a match between two bots
+  nashium scaffold my_bot.py            Create a new bot from template
+  nashium qualify my_bot.py             Test against sample opponents  
+  nashium qualify my_bot.py --sandbox   Test in sandboxed subprocess
+  nashium check my_bot.py               Verify your bot is deterministic
+  nashium run bot_a.py bot_b.py         Run a match between two bots
         """
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # Scaffold
     p_scaffold = sub.add_parser("scaffold", help="Create a new bot from template")
-    p_scaffold.add_argument("path", help="Path for the new bot file (e.g., my_bot.py)")
+    p_scaffold.add_argument("path", help="Path for the new bot file")
     p_scaffold.set_defaults(func=cmd_scaffold)
 
     # Check
     p_check = sub.add_parser("check", help="Verify your bot is deterministic")
     p_check.add_argument("bot", help="Your bot file")
-    p_check.add_argument("--rounds", type=int, default=2_000, help="Rounds per test (default: 2000)")
-    p_check.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
-    p_check.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
-    p_check.add_argument("--sandbox",action="store_true",help="Run in sandboxed subprocess (slower but safer)")
+    p_check.add_argument("--rounds", type=int, default=2_000)
+    p_check.add_argument("--seed", type=int, default=None)
+    p_check.add_argument("--time-budget", type=float, default=100.0)
+    p_check.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_check.set_defaults(func=cmd_check)
 
     # Run
     p_run = sub.add_parser("run", help="Run a match between two bots")
-    p_run.add_argument("bot_a", help="First bot file (predictor)")
-    p_run.add_argument("bot_b", help="Second bot file (hider)")
-    p_run.add_argument("--rounds", type=int, default=10_000, help="Rounds to play (default: 10000)")
-    p_run.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
-    p_run.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
-    p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess (slower but safer)")
+    p_run.add_argument("bot_a", help="First bot file")
+    p_run.add_argument("bot_b", help="Second bot file")
+    p_run.add_argument("--rounds", type=int, default=10_000)
+    p_run.add_argument("--seed", type=int, default=None)
+    p_run.add_argument("--time-budget", type=float, default=100.0)
+    p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_run.set_defaults(func=cmd_run)
 
     # Qualify
     p_qualify = sub.add_parser("qualify", help="Test your bot against sample opponents")
     p_qualify.add_argument("bot", help="Your bot file")
-    p_qualify.add_argument("--rounds", type=int, default=10_000, help="Rounds per match (default: 10000)")
-    p_qualify.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
-    p_qualify.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
-    p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess (slower but safer)")
+    p_qualify.add_argument("--rounds", type=int, default=10_000)
+    p_qualify.add_argument("--seed", type=int, default=None)
+    p_qualify.add_argument("--time-budget", type=float, default=100.0)
+    p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_qualify.set_defaults(func=cmd_qualify)
 
     args = parser.parse_args(argv)
