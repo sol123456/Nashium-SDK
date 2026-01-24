@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from .errors import BotTimeoutError, InvalidMoveError
+from .errors import InvalidMoveError
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,8 @@ class MatchSummary:
     submitted_time_seconds: float
     leaderboard_time_seconds: float
     wall_time_seconds: float
+    submitted_timed_out: bool = False
+    leaderboard_timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,11 +61,11 @@ def _validate_move(move: int, round_index: int, bot_name: str = "Bot") -> int:
 
 
 def _play_rounds(
-    submitted_bot,
-    leaderboard_bot,
-    config: MatchConfig,
-    *,
-    capture_histories: bool,
+        submitted_bot,
+        leaderboard_bot,
+        config: MatchConfig,
+        *,
+        capture_histories: bool,
 ):
     submitted_history: list[int] = []
     leaderboard_raw_history: list[int] = []
@@ -73,25 +75,35 @@ def _play_rounds(
     submitted_time = 0.0
     leaderboard_time = 0.0
 
+    # Track if bots have timed out - they default to 0 for remaining moves
+    submitted_timed_out = False
+    leaderboard_timed_out = False
+
     for i in range(config.rounds):
         s_state = RoundState(i, tuple(submitted_history), tuple(leaderboard_effective_history))
         l_state = RoundState(i, tuple(leaderboard_raw_history), tuple(submitted_history))
 
-        s_start = time.perf_counter()
-        s_move = _validate_move(int(submitted_bot.move(s_state)), i, "Submitted bot")
-        submitted_time += time.perf_counter() - s_start
-        if submitted_time > config.max_total_time_seconds_per_bot:
-            raise BotTimeoutError(
-                f"Submitted bot exceeded total time budget of {config.max_total_time_seconds_per_bot} seconds"
-            )
+        # Submitted bot move
+        if submitted_timed_out:
+            s_move = 0  # Default to 0 when timed out
+        else:
+            s_start = time.perf_counter()
+            s_move = _validate_move(int(submitted_bot.move(s_state)), i, "Submitted bot")
+            submitted_time += time.perf_counter() - s_start
+            if submitted_time > config.max_total_time_seconds_per_bot:
+                submitted_timed_out = True
+                # Bot exceeded time limit - all future moves will be 0
+                # Current move still counts since it was already made
 
-        l_start = time.perf_counter()
-        l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)), i, "Leaderboard bot")
-        leaderboard_time += time.perf_counter() - l_start
-        if leaderboard_time > config.max_total_time_seconds_per_bot:
-            raise BotTimeoutError(
-                f"Leaderboard bot exceeded total time budget of {config.max_total_time_seconds_per_bot} seconds"
-            )
+        # Leaderboard bot move
+        if leaderboard_timed_out:
+            l_move_raw = 0  # Default to 0 when timed out
+        else:
+            l_start = time.perf_counter()
+            l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)), i, "Leaderboard bot")
+            leaderboard_time += time.perf_counter() - l_start
+            if leaderboard_time > config.max_total_time_seconds_per_bot:
+                leaderboard_timed_out = True
 
         l_move = (1 - l_move_raw) if config.invert_opponent else l_move_raw
 
@@ -110,6 +122,8 @@ def _play_rounds(
             tuple(leaderboard_effective_history),
             submitted_time,
             leaderboard_time,
+            submitted_timed_out,
+            leaderboard_timed_out,
         )
 
     return (
@@ -119,13 +133,24 @@ def _play_rounds(
         None,
         submitted_time,
         leaderboard_time,
+        submitted_timed_out,
+        leaderboard_timed_out,
     )
 
 
 def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSummary:
     start = time.perf_counter()
 
-    submitted_wins, _s_hist, _l_raw, _l_eff, submitted_time, leaderboard_time = _play_rounds(
+    (
+        submitted_wins,
+        _s_hist,
+        _l_raw,
+        _l_eff,
+        submitted_time,
+        leaderboard_time,
+        submitted_timed_out,
+        leaderboard_timed_out,
+    ) = _play_rounds(
         submitted_bot,
         leaderboard_bot,
         config,
@@ -136,8 +161,8 @@ def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSumma
 
     win_rate = submitted_wins / config.rounds if config.rounds else 0.0
     stat_sig = (
-        submitted_wins >= config.stat_sig_win_threshold
-        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
+            submitted_wins >= config.stat_sig_win_threshold
+            or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
     )
 
     if submitted_wins >= config.stat_sig_win_threshold:
@@ -161,13 +186,24 @@ def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSumma
         submitted_time_seconds=submitted_time,
         leaderboard_time_seconds=leaderboard_time,
         wall_time_seconds=end - start,
+        submitted_timed_out=submitted_timed_out,
+        leaderboard_timed_out=leaderboard_timed_out,
     )
 
 
 def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchTrace:
     start = time.perf_counter()
 
-    submitted_wins, s_hist, l_raw, l_eff, submitted_time, leaderboard_time = _play_rounds(
+    (
+        submitted_wins,
+        s_hist,
+        l_raw,
+        l_eff,
+        submitted_time,
+        leaderboard_time,
+        submitted_timed_out,
+        leaderboard_timed_out,
+    ) = _play_rounds(
         submitted_bot,
         leaderboard_bot,
         config,
@@ -178,8 +214,8 @@ def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> Matc
 
     win_rate = submitted_wins / config.rounds if config.rounds else 0.0
     stat_sig = (
-        submitted_wins >= config.stat_sig_win_threshold
-        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
+            submitted_wins >= config.stat_sig_win_threshold
+            or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
     )
 
     if submitted_wins >= config.stat_sig_win_threshold:
@@ -203,6 +239,8 @@ def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> Matc
         submitted_time_seconds=submitted_time,
         leaderboard_time_seconds=leaderboard_time,
         wall_time_seconds=end - start,
+        submitted_timed_out=submitted_timed_out,
+        leaderboard_timed_out=leaderboard_timed_out,
     )
 
     return MatchTrace(

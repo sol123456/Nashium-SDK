@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
 from .client import NashiumClient, NashiumClientConfig
@@ -13,6 +14,7 @@ from .formatting import (
     print_header,
     print_info,
     print_success,
+    print_warning,
 )
 from .loading import load_bot_from_file
 from .sample_bots import determinism_test_bot_factories, sample_leaderboard_bots
@@ -22,6 +24,11 @@ from ..core.util import stable_seed
 
 def _read_bytes(path: str | Path) -> bytes:
     return Path(path).read_bytes()
+
+
+def _generate_random_seed() -> int:
+    """Generate a random seed for match execution."""
+    return random.randint(0, (1 << 63) - 1)
 
 
 # ============================================================================
@@ -168,7 +175,8 @@ def run_determinism_check(bot_path: Path, seed: int, config: MatchConfig, verbos
     failed_opponents = []
 
     if verbose:
-        print_info("Checking determinism (running your bot twice with same seed)...")
+        print_info(f"Checking determinism with seed: {seed}")
+        print_info("Running your bot twice with the same seed to verify identical behavior...")
         print()
 
     for name, create_opponent in opponent_factories:
@@ -214,9 +222,14 @@ def cmd_qualify(args: argparse.Namespace) -> int:
 
     print_header(f"Qualifying: {submitted_path.name}")
 
-    seed = args.seed
-    if seed is None:
-        seed = stable_seed(_read_bytes(submitted_path), b"sample_leaderboard")
+    # Use provided seed or generate random
+    if args.seed is not None:
+        seed = args.seed
+        print_info(f"Using provided seed: {seed}")
+    else:
+        seed = _generate_random_seed()
+        print_info(f"Using random seed: {seed}")
+    print()
 
     config = MatchConfig(
         rounds=args.rounds,
@@ -231,8 +244,11 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
+    # Use a different random seed for determinism check (but fixed if user provided one)
+    det_seed = seed if args.seed is not None else _generate_random_seed()
+
     is_deterministic, failed_det_opponents = run_determinism_check(
-        submitted_path, seed, determinism_config, verbose=False
+        submitted_path, det_seed, determinism_config, verbose=False
     )
 
     if is_deterministic:
@@ -247,13 +263,20 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     results = []
     max_time_used = 0.0
     all_pass = True
+    any_timed_out = False
 
     for name, opp in opponents:
-        submitted = load_bot_from_file(submitted_path, seed)
+        # Generate a unique seed for each opponent match
+        match_seed = seed if args.seed is not None else _generate_random_seed()
+
+        submitted = load_bot_from_file(submitted_path, match_seed)
         summary = run_match(submitted, opp, config)
 
         max_time_used = max(max_time_used, summary.submitted_time_seconds)
         passed = summary.result == InteractionResult.S_WIN and summary.stat_sig
+
+        if summary.submitted_timed_out:
+            any_timed_out = True
 
         status, explanation = format_result(
             summary.result, summary.stat_sig, summary.submitted_wins, summary.rounds
@@ -268,27 +291,38 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             'rounds': summary.rounds,
             'win_rate': summary.submitted_win_rate,
             'time': summary.submitted_time_seconds,
+            'seed': match_seed,
+            'timed_out': summary.submitted_timed_out,
         })
 
         if not passed:
             all_pass = False
 
     # Print results table
-    print(f"  {'Opponent':<20} {'Result':<25} {'Win Rate':<12} {'Time':<10}")
-    print(f"  {'-' * 20} {'-' * 25} {'-' * 12} {'-' * 10}")
+    print(f"  {'Opponent':<18} {'Result':<20} {'Win Rate':<10} {'Time':<10} {'Seed':<20}")
+    print(f"  {'-' * 18} {'-' * 20} {'-' * 10} {'-' * 10} {'-' * 20}")
 
     for r in results:
         win_rate_str = f"{r['win_rate'] * 100:.1f}%"
         time_str = f"{r['time']:.2f}s"
+        if r['timed_out']:
+            time_str += " ⏱"  # Indicator that bot timed out
+        seed_str = str(r['seed'])
 
         if r['passed']:
             icon = f"{Colors.GREEN}✓{Colors.RESET}"
         else:
             icon = f"{Colors.RED}✗{Colors.RESET}"
 
-        print(f"  {icon} {r['name']:<18} {r['status']:<35} {win_rate_str:<12} {time_str:<10}")
+        print(f"  {icon} {r['name']:<16} {r['status']:<30} {win_rate_str:<10} {time_str:<10} {seed_str:<20}")
 
     print()
+
+    # Timeout warning
+    if any_timed_out:
+        print_warning("Your bot exceeded the 100 second time limit in one or more matches!")
+        print_dim("When a bot times out, it defaults to playing 0 for all remaining rounds.")
+        print()
 
     # Time analysis
     print(f"  {Colors.BOLD}Time Analysis:{Colors.RESET}")
@@ -302,6 +336,12 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         print_header("🎉 QUALIFIED!")
         print_success("Your bot beat all test opponents with statistical significance!")
         print_success("Your bot is deterministic!")
+        print()
+        print(f"  {Colors.YELLOW}⚠ DISCLAIMER:{Colors.RESET}")
+        print("    This result is only an indication. On the server, your bot will run")
+        print("    with a different seed and on different hardware, which may cause")
+        print("    different results. Consider running this qualifier multiple times")
+        print("    to ensure consistent performance.")
         print()
         print("  Your bot is ready to submit:")
         print(
@@ -345,6 +385,11 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             print("    • 'alternator' switches between 0 and 1 each round")
             print()
 
+        print(f"  {Colors.YELLOW}⚠ DISCLAIMER:{Colors.RESET}")
+        print("    Results vary with different seeds and hardware. Consider running this qualifier")
+        print("    multiple times, and be aware that local results may not match server results.")
+        print()
+
         return 2
 
 
@@ -361,9 +406,14 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     print_header(f"Checking Determinism: {submitted_path.name}")
 
-    seed = args.seed
-    if seed is None:
-        seed = stable_seed(_read_bytes(submitted_path), b"determinism_check")
+    # Use provided seed or generate random
+    if args.seed is not None:
+        seed = args.seed
+        print_info(f"Using provided seed: {seed}")
+    else:
+        seed = _generate_random_seed()
+        print_info(f"Using random seed: {seed}")
+    print()
 
     config = MatchConfig(
         rounds=args.rounds,
@@ -381,10 +431,16 @@ def cmd_check(args: argparse.Namespace) -> int:
         print()
         print("  This is required for fair competition. Your bot is ready!")
         print()
+        print(
+            f"  {Colors.DIM}To verify with a specific seed: nashium check {submitted_path.name} --seed {seed}{Colors.RESET}")
+        print()
         return 0
     else:
         print_header("✗ NOT DETERMINISTIC")
         print_failure("Your bot produces DIFFERENT moves when run twice with the same seed!")
+        print()
+        print(f"  Seed used: {seed}")
+        print(f"  To reproduce: {Colors.CYAN}nashium check {submitted_path.name} --seed {seed}{Colors.RESET}")
         print()
         print("  This is not allowed. Common causes:")
         print(
@@ -416,9 +472,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print_header(f"Match: {a_path.name} vs {b_path.name}")
 
-    seed = args.seed
-    if seed is None:
-        seed = stable_seed(_read_bytes(a_path), _read_bytes(b_path))
+    # Use provided seed or generate random
+    if args.seed is not None:
+        seed = args.seed
+        print_info(f"Using provided seed: {seed}")
+    else:
+        seed = _generate_random_seed()
+        print_info(f"Using random seed: {seed}")
+    print()
 
     bot_a = load_bot_from_file(a_path, seed)
     bot_b = load_bot_from_file(b_path, seed)
@@ -444,76 +505,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"    Result:            {status}")
     print(f"    {explanation}")
     print()
+
+    # Timeout info
+    if summary.submitted_timed_out or summary.leaderboard_timed_out:
+        print(f"  {Colors.BOLD}Timeouts:{Colors.RESET}")
+        if summary.submitted_timed_out:
+            print_warning(f"    Bot A exceeded time limit and defaulted to 0 for remaining moves")
+        if summary.leaderboard_timed_out:
+            print_warning(f"    Bot B exceeded time limit and defaulted to 0 for remaining moves")
+        print()
+
     print(f"  {Colors.BOLD}Performance:{Colors.RESET}")
     print(f"    Bot A time:        {summary.submitted_time_seconds:.3f}s")
     print(f"    Bot B time:        {summary.leaderboard_time_seconds:.3f}s")
     print(f"    Total wall time:   {summary.wall_time_seconds:.3f}s")
     print()
+    print(f"  {Colors.DIM}Seed: {seed}{Colors.RESET}")
+    print(f"  {Colors.DIM}To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}{Colors.RESET}")
+    print()
 
     return 0
-
-
-# ============================================================================
-# SEED COMMAND
-# ============================================================================
-
-def cmd_seed(args: argparse.Namespace) -> int:
-    a_path = Path(args.bot_a)
-    b_path = Path(args.bot_b)
-
-    if not a_path.exists():
-        print_failure(f"File not found: {a_path}")
-        return 1
-    if not b_path.exists():
-        print_failure(f"File not found: {b_path}")
-        return 1
-
-    seed = stable_seed(_read_bytes(a_path), _read_bytes(b_path))
-    print(f"Seed for {a_path.name} vs {b_path.name}: {seed}")
-    return 0
-
-
-# ============================================================================
-# UPLOAD COMMAND
-# ============================================================================
-
-def cmd_upload(args: argparse.Namespace) -> int:
-    bot_path = Path(args.bot)
-
-    if not bot_path.exists():
-        print_failure(f"Bot file not found: {bot_path}")
-        return 1
-
-    print_header(f"Uploading: {args.name}")
-
-    code = bot_path.read_text(encoding="utf-8")
-
-    client = NashiumClient(
-        NashiumClientConfig(
-            base_url=args.base_url,
-            bearer_token=args.token,
-            timeout_seconds=args.timeout_seconds,
-        )
-    )
-
-    payload = {
-        "name": args.name,
-        "code": code,
-    }
-
-    try:
-        resp = client.request_json("POST", args.endpoint, payload=payload)
-        print_success("Bot uploaded successfully!")
-        print()
-        if resp:
-            if 'botId' in resp:
-                print(f"  Bot ID: {resp['botId']}")
-            if 'queuePosition' in resp:
-                print(f"  Queue position: {resp['queuePosition']}")
-            if 'message' in resp:
-                print(f"  {resp['message']}")
-        print()
-        return 0
-    except Exception as e:
-        print_failure(f"Upload failed: {e}")
-        return 1

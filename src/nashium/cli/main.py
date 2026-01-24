@@ -5,7 +5,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .commands import cmd_check, cmd_qualify, cmd_run, cmd_scaffold, cmd_seed, cmd_upload
+from .commands import cmd_check, cmd_qualify, cmd_run, cmd_scaffold
 from .formatting import Colors, format_user_error
 from ..core.errors import BotLoadError, BotTimeoutError, InvalidMoveError
 
@@ -29,12 +29,6 @@ Examples:
     p_scaffold = sub.add_parser("scaffold", help="Create a new bot from template")
     p_scaffold.add_argument("path", help="Path for the new bot file (e.g., my_bot.py)")
     p_scaffold.set_defaults(func=cmd_scaffold)
-
-    # Seed
-    p_seed = sub.add_parser("seed", help="Calculate the seed for two bots")
-    p_seed.add_argument("bot_a", help="First bot file")
-    p_seed.add_argument("bot_b", help="Second bot file")
-    p_seed.set_defaults(func=cmd_seed)
 
     # Check
     p_check = sub.add_parser("check", help="Verify your bot is deterministic")
@@ -65,16 +59,6 @@ Examples:
     p_qualify.set_defaults(invert_opponent=True)
     p_qualify.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
     p_qualify.set_defaults(func=cmd_qualify)
-
-    # Upload
-    p_upload = sub.add_parser("upload", help="Upload your bot to the server")
-    p_upload.add_argument("bot", help="Your bot file")
-    p_upload.add_argument("--name", required=True, help="Name for your bot")
-    p_upload.add_argument("--base-url", required=True, help="Server URL (e.g., https://nashium.com)")
-    p_upload.add_argument("--endpoint", default="/api/bots/submit", help="API endpoint")
-    p_upload.add_argument("--token", default=None, help="Your authentication token")
-    p_upload.add_argument("--timeout-seconds", type=float, default=30.0)
-    p_upload.set_defaults(func=cmd_upload)
 
     args = parser.parse_args(argv)
 
