@@ -50,10 +50,12 @@ class MatchTrace:
     leaderboard_moves_effective: tuple[int, ...]
 
 
-def _validate_move(move: int) -> int:
+def _validate_move(move: int, round_index: int, bot_name: str = "Bot") -> int:
     if move in (0, 1):
         return move
-    raise InvalidMoveError(f"Bot returned invalid move {move!r}. Expected 0 or 1.")
+    raise InvalidMoveError(
+        f"{bot_name} returned invalid move {move!r} on round {round_index}. Expected 0 or 1."
+    )
 
 
 def _play_rounds(
@@ -76,7 +78,7 @@ def _play_rounds(
         l_state = RoundState(i, tuple(leaderboard_raw_history), tuple(submitted_history))
 
         s_start = time.perf_counter()
-        s_move = _validate_move(int(submitted_bot.move(s_state)))
+        s_move = _validate_move(int(submitted_bot.move(s_state)), i, "Submitted bot")
         submitted_time += time.perf_counter() - s_start
         if submitted_time > config.max_total_time_seconds_per_bot:
             raise BotTimeoutError(
@@ -84,7 +86,7 @@ def _play_rounds(
             )
 
         l_start = time.perf_counter()
-        l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)))
+        l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)), i, "Leaderboard bot")
         leaderboard_time += time.perf_counter() - l_start
         if leaderboard_time > config.max_total_time_seconds_per_bot:
             raise BotTimeoutError(

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import random
+from typing import Callable
 
-from nashium.core.engine import RoundState
+from ..core import RoundState
 
+###################################################################################################################
 # PLEASE NOTE: If you change these bots, the qualification code may not correctly test your bot.
+###################################################################################################################
+
 class AlwaysHeads:
     """Always plays 0 (Heads). Trivial to beat."""
 
@@ -47,7 +51,7 @@ class FrequencyCounter:
 
 
 class RandomBot:
-    """Plays randomly. Hard to beat consistently."""
+    """Plays randomly. Used for determinism testing."""
 
     def __init__(self, seed: int):
         self.rng = random.Random(seed)
@@ -60,6 +64,8 @@ def sample_leaderboard_bots(seed: int) -> list[tuple[str, object]]:
     """
     Returns the sample bots used for local qualification testing.
     These are intentionally simple - the real leaderboard bots will be harder!
+
+    Note: RandomBot is NOT included here because you can't reliably beat true random.
     """
     return [
         ("always_heads", AlwaysHeads()),
@@ -67,5 +73,28 @@ def sample_leaderboard_bots(seed: int) -> list[tuple[str, object]]:
         ("alternator", Alternator()),
         ("mirror", MirrorOpponent()),
         ("frequency_counter", FrequencyCounter()),
-        # Note: RandomBot not included because you can't reliably beat true random
+    ]
+
+
+# Type alias for bot factory functions
+BotFactory = Callable[[int], object]
+
+
+def determinism_test_bot_factories() -> list[tuple[str, BotFactory]]:
+    """
+    Returns FACTORIES for bots used in determinism testing.
+
+    We return factories (functions that create bots) instead of instances
+    because each test run needs a FRESH bot instance. If we reused the same
+    RandomBot instance, its internal RNG state would be different on the
+    second run, causing false "not deterministic" results.
+
+    Includes RandomBot because it's the most important for catching non-determinism
+    in the user's bot - if their bot uses unseeded randomness, it will produce
+    different moves against the same random opponent sequence.
+    """
+    return [
+        ("always_heads", lambda seed: AlwaysHeads()),
+        ("alternator", lambda seed: Alternator()),
+        ("random", lambda seed: RandomBot(seed)),  # Most important for determinism!
     ]

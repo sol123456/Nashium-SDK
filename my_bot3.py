@@ -74,7 +74,9 @@ class MyBot:
         """
         # Round 0: No history yet, just guess
         if state.round_index == 0:
-            return state.opponent_history[-1]
+            return random.choice([0, 1])
+
+
 
         # Simple strategy: Predict opponent will repeat their last move
         # This beats "always same" and "repeat last" opponents
