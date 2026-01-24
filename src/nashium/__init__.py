@@ -20,6 +20,6 @@ from nashium.core.engine import (
     run_match,
     run_match_trace,
 )
-from nashium.cli.loading import load_bot_from_file
+from nashium.cli.loader import load_bot_from_file
 
 __version__ = "0.1.0"

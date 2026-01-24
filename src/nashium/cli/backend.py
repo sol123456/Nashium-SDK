@@ -107,7 +107,7 @@ class LocalBackend(Backend):
             seed: int,
             config: MatchConfig,
     ) -> MatchSummary:
-        from .loading import load_bot_from_file
+        from .loader import load_bot_from_file
 
         submitted = load_bot_from_file(submitted_path, seed)
         opponent = _load_bot_from_source(opponent_source, seed)
@@ -120,7 +120,7 @@ class LocalBackend(Backend):
             seed: int,
             config: MatchConfig,
     ) -> MatchTrace:
-        from .loading import load_bot_from_file
+        from .loader import load_bot_from_file
 
         submitted = load_bot_from_file(submitted_path, seed)
         opponent = _load_bot_from_source(opponent_source, seed)
@@ -133,7 +133,7 @@ class LocalBackend(Backend):
             seed: int,
             config: MatchConfig,
     ) -> MatchSummary:
-        from .loading import load_bot_from_file
+        from .loader import load_bot_from_file
 
         bot_a = load_bot_from_file(path_a, seed)
         bot_b = load_bot_from_file(path_b, seed)
