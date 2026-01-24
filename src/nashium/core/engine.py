@@ -25,7 +25,6 @@ class InteractionResult(str, Enum):
 @dataclass(frozen=True)
 class MatchConfig:
     rounds: int = 10_000
-    invert_opponent: bool = True
     stat_sig_win_threshold: int = 5155
     max_total_time_seconds_per_bot: float = 100.0
 
@@ -75,7 +74,6 @@ def _play_rounds(
     submitted_time = 0.0
     leaderboard_time = 0.0
 
-    # Track if bots have timed out - they default to 0 for remaining moves
     submitted_timed_out = False
     leaderboard_timed_out = False
 
@@ -85,19 +83,17 @@ def _play_rounds(
 
         # Submitted bot move
         if submitted_timed_out:
-            s_move = 0  # Default to 0 when timed out
+            s_move = 0
         else:
             s_start = time.perf_counter()
             s_move = _validate_move(int(submitted_bot.move(s_state)), i, "Submitted bot")
             submitted_time += time.perf_counter() - s_start
             if submitted_time > config.max_total_time_seconds_per_bot:
                 submitted_timed_out = True
-                # Bot exceeded time limit - all future moves will be 0
-                # Current move still counts since it was already made
 
         # Leaderboard bot move
         if leaderboard_timed_out:
-            l_move_raw = 0  # Default to 0 when timed out
+            l_move_raw = 0
         else:
             l_start = time.perf_counter()
             l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)), i, "Leaderboard bot")
@@ -105,8 +101,11 @@ def _play_rounds(
             if leaderboard_time > config.max_total_time_seconds_per_bot:
                 leaderboard_timed_out = True
 
-        l_move = (1 - l_move_raw) if config.invert_opponent else l_move_raw
+        # Always invert opponent - this makes the game zero-sum
+        # The leaderboard bot doesn't know it's inverted; it just outputs 0 or 1
+        l_move = 1 - l_move_raw
 
+        # Submitted bot wins if they match (predicted correctly)
         if s_move == l_move:
             submitted_wins += 1
 

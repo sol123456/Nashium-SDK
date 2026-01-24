@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
         epilog="""
 Examples:
   nashium scaffold my_bot.py          Create a new bot from template
-  nashium qualify my_bot.py           Test against sample opponents
+  nashium qualify my_bot.py           Test against sample opponents  
   nashium check my_bot.py             Verify your bot is deterministic
   nashium run bot_a.py bot_b.py       Run a match between two bots
         """
@@ -34,19 +34,16 @@ Examples:
     p_check = sub.add_parser("check", help="Verify your bot is deterministic")
     p_check.add_argument("bot", help="Your bot file")
     p_check.add_argument("--rounds", type=int, default=2_000, help="Rounds per test (default: 2000)")
-    p_check.add_argument("--seed", type=int, default=None, help="Override the random seed")
-    p_check.add_argument("--no-invert-opponent", action="store_false", dest="invert_opponent")
-    p_check.set_defaults(invert_opponent=True)
+    p_check.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_check.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
     p_check.set_defaults(func=cmd_check)
 
     # Run
     p_run = sub.add_parser("run", help="Run a match between two bots")
-    p_run.add_argument("bot_a", help="First bot file (treated as 'submitted')")
-    p_run.add_argument("bot_b", help="Second bot file (treated as 'opponent')")
+    p_run.add_argument("bot_a", help="First bot file (predictor)")
+    p_run.add_argument("bot_b", help="Second bot file (hider)")
     p_run.add_argument("--rounds", type=int, default=10_000, help="Rounds to play (default: 10000)")
-    p_run.add_argument("--seed", type=int, default=None, help="Override the random seed")
-    p_run.add_argument("--invert-opponent", action="store_true", default=False, help="Invert opponent moves")
+    p_run.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_run.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
     p_run.set_defaults(func=cmd_run)
 
@@ -54,9 +51,7 @@ Examples:
     p_qualify = sub.add_parser("qualify", help="Test your bot against sample opponents")
     p_qualify.add_argument("bot", help="Your bot file")
     p_qualify.add_argument("--rounds", type=int, default=10_000, help="Rounds per match (default: 10000)")
-    p_qualify.add_argument("--seed", type=int, default=None, help="Override the random seed")
-    p_qualify.add_argument("--no-invert-opponent", action="store_false", dest="invert_opponent")
-    p_qualify.set_defaults(invert_opponent=True)
+    p_qualify.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_qualify.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
     p_qualify.set_defaults(func=cmd_qualify)
 
@@ -71,7 +66,6 @@ Examples:
     except Exception as e:
         bot_path = Path(getattr(args, 'bot', getattr(args, 'bot_a', 'your_bot.py')))
         print(format_user_error(e, bot_path))
-        # Show technical details in dim
         print(f"\n{Colors.DIM}Technical details:{Colors.RESET}")
         print(Colors.DIM)
         traceback.print_exc()

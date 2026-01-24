@@ -4,7 +4,6 @@ import argparse
 import random
 from pathlib import Path
 
-from .client import NashiumClient, NashiumClientConfig
 from .formatting import (
     Colors,
     format_result,
@@ -19,7 +18,6 @@ from .formatting import (
 from .loading import load_bot_from_file
 from .sample_bots import determinism_test_bot_factories, sample_leaderboard_bots
 from ..core import InteractionResult, MatchConfig, run_match, run_match_trace
-from ..core.util import stable_seed
 
 
 def _read_bytes(path: str | Path) -> bytes:
@@ -169,25 +167,20 @@ def run_determinism_check(bot_path: Path, seed: int, config: MatchConfig, verbos
     Returns:
         (is_deterministic, list of failed opponent names)
     """
-    # Get bot FACTORIES, not instances!
-    # This is crucial: we need fresh opponent instances for each run
     opponent_factories = determinism_test_bot_factories()
     failed_opponents = []
 
     if verbose:
-        print_info(f"Checking determinism with seed: {seed}")
         print_info("Running your bot twice with the same seed to verify identical behavior...")
         print()
 
     for name, create_opponent in opponent_factories:
-        # Run 1: Create fresh instances of BOTH user bot and opponent
         bot_1 = load_bot_from_file(bot_path, seed)
         opponent_1 = create_opponent(seed)
         trace_1 = run_match_trace(bot_1, opponent_1, config)
 
-        # Run 2: Create fresh instances again - this is the key fix!
         bot_2 = load_bot_from_file(bot_path, seed)
-        opponent_2 = create_opponent(seed)  # Fresh opponent with reset RNG
+        opponent_2 = create_opponent(seed)
         trace_2 = run_match_trace(bot_2, opponent_2, config)
 
         same = trace_1.submitted_moves == trace_2.submitted_moves
@@ -197,7 +190,6 @@ def run_determinism_check(bot_path: Path, seed: int, config: MatchConfig, verbos
                 print_success(f"vs {name}: Deterministic ✓")
             else:
                 print_failure(f"vs {name}: NOT deterministic!")
-                # Find first difference
                 for i, (m1, m2) in enumerate(zip(trace_1.submitted_moves, trace_2.submitted_moves)):
                     if m1 != m2:
                         print_dim(f"First difference at round {i}: got {m1} then {m2}")
@@ -222,33 +214,30 @@ def cmd_qualify(args: argparse.Namespace) -> int:
 
     print_header(f"Qualifying: {submitted_path.name}")
 
-    # Use provided seed or generate random
+    # Determine seed
     if args.seed is not None:
         seed = args.seed
         print_info(f"Using provided seed: {seed}")
     else:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
+
+    print_dim(f"To reproduce this exact run: nashium qualify {submitted_path.name} --seed {seed}")
     print()
 
     config = MatchConfig(
         rounds=args.rounds,
-        invert_opponent=args.invert_opponent,
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
     # =========== STEP 1: Determinism Check ===========
     determinism_config = MatchConfig(
-        rounds=2000,  # Shorter for determinism check
-        invert_opponent=args.invert_opponent,
+        rounds=2000,
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
-    # Use a different random seed for determinism check (but fixed if user provided one)
-    det_seed = seed if args.seed is not None else _generate_random_seed()
-
     is_deterministic, failed_det_opponents = run_determinism_check(
-        submitted_path, det_seed, determinism_config, verbose=False
+        submitted_path, seed, determinism_config, verbose=False
     )
 
     if is_deterministic:
@@ -266,10 +255,7 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     any_timed_out = False
 
     for name, opp in opponents:
-        # Generate a unique seed for each opponent match
-        match_seed = seed if args.seed is not None else _generate_random_seed()
-
-        submitted = load_bot_from_file(submitted_path, match_seed)
+        submitted = load_bot_from_file(submitted_path, seed)
         summary = run_match(submitted, opp, config)
 
         max_time_used = max(max_time_used, summary.submitted_time_seconds)
@@ -291,7 +277,6 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             'rounds': summary.rounds,
             'win_rate': summary.submitted_win_rate,
             'time': summary.submitted_time_seconds,
-            'seed': match_seed,
             'timed_out': summary.submitted_timed_out,
         })
 
@@ -299,32 +284,29 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             all_pass = False
 
     # Print results table
-    print(f"  {'Opponent':<18} {'Result':<20} {'Win Rate':<10} {'Time':<10} {'Seed':<20}")
-    print(f"  {'-' * 18} {'-' * 20} {'-' * 10} {'-' * 10} {'-' * 20}")
+    print(f"  {'Opponent':<20} {'Result':<25} {'Win Rate':<12} {'Time':<10}")
+    print(f"  {'-' * 20} {'-' * 25} {'-' * 12} {'-' * 10}")
 
     for r in results:
         win_rate_str = f"{r['win_rate'] * 100:.1f}%"
         time_str = f"{r['time']:.2f}s"
         if r['timed_out']:
-            time_str += " ⏱"  # Indicator that bot timed out
-        seed_str = str(r['seed'])
+            time_str += " ⏱"
 
         if r['passed']:
             icon = f"{Colors.GREEN}✓{Colors.RESET}"
         else:
             icon = f"{Colors.RED}✗{Colors.RESET}"
 
-        print(f"  {icon} {r['name']:<16} {r['status']:<30} {win_rate_str:<10} {time_str:<10} {seed_str:<20}")
+        print(f"  {icon} {r['name']:<18} {r['status']:<35} {win_rate_str:<12} {time_str:<10}")
 
     print()
 
-    # Timeout warning
     if any_timed_out:
         print_warning("Your bot exceeded the 100 second time limit in one or more matches!")
         print_dim("When a bot times out, it defaults to playing 0 for all remaining rounds.")
         print()
 
-    # Time analysis
     print(f"  {Colors.BOLD}Time Analysis:{Colors.RESET}")
     print(f"    {format_time_warning(max_time_used, args.time_budget)}")
     print()
@@ -343,15 +325,10 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         print("    different results. Consider running this qualifier multiple times")
         print("    to ensure consistent performance.")
         print()
-        print("  Your bot is ready to submit:")
-        print(
-            f"    {Colors.CYAN}nashium upload {submitted_path} --name \"My Bot\" --base-url https://nashium.com{Colors.RESET}")
-        print()
         return 0
     else:
         print_header("❌ DID NOT QUALIFY")
 
-        # List all failure reasons
         failure_reasons = []
 
         if not is_deterministic:
@@ -386,15 +363,15 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             print()
 
         print(f"  {Colors.YELLOW}⚠ DISCLAIMER:{Colors.RESET}")
-        print("    Results vary with different seeds and hardware. Consider running this qualifier")
-        print("    multiple times, and be aware that local results may not match server results.")
+        print("    Results vary with different seeds and hardware. Consider running")
+        print("    the qualifier multiple times to test consistency.")
         print()
 
         return 2
 
 
 # ============================================================================
-# CHECK COMMAND (detailed determinism)
+# CHECK COMMAND
 # ============================================================================
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -406,18 +383,18 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     print_header(f"Checking Determinism: {submitted_path.name}")
 
-    # Use provided seed or generate random
     if args.seed is not None:
         seed = args.seed
         print_info(f"Using provided seed: {seed}")
     else:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
+
+    print_dim(f"To reproduce: nashium check {submitted_path.name} --seed {seed}")
     print()
 
     config = MatchConfig(
         rounds=args.rounds,
-        invert_opponent=args.invert_opponent,
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
@@ -431,16 +408,10 @@ def cmd_check(args: argparse.Namespace) -> int:
         print()
         print("  This is required for fair competition. Your bot is ready!")
         print()
-        print(
-            f"  {Colors.DIM}To verify with a specific seed: nashium check {submitted_path.name} --seed {seed}{Colors.RESET}")
-        print()
         return 0
     else:
         print_header("✗ NOT DETERMINISTIC")
         print_failure("Your bot produces DIFFERENT moves when run twice with the same seed!")
-        print()
-        print(f"  Seed used: {seed}")
-        print(f"  To reproduce: {Colors.CYAN}nashium check {submitted_path.name} --seed {seed}{Colors.RESET}")
         print()
         print("  This is not allowed. Common causes:")
         print(
@@ -472,13 +443,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print_header(f"Match: {a_path.name} vs {b_path.name}")
 
-    # Use provided seed or generate random
     if args.seed is not None:
         seed = args.seed
         print_info(f"Using provided seed: {seed}")
     else:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
+
+    print_dim(f"To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}")
     print()
 
     bot_a = load_bot_from_file(a_path, seed)
@@ -486,7 +458,6 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     config = MatchConfig(
         rounds=args.rounds,
-        invert_opponent=args.invert_opponent,
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
@@ -498,30 +469,26 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print(f"  {Colors.BOLD}Results:{Colors.RESET}")
     print(f"    Rounds played:     {summary.rounds:,}")
-    print(f"    Bot A wins:        {summary.submitted_wins:,} ({summary.submitted_win_rate * 100:.2f}%)")
+    print(f"    {a_path.name} wins: {summary.submitted_wins:,} ({summary.submitted_win_rate * 100:.2f}%)")
     print(
-        f"    Bot B wins:        {summary.rounds - summary.submitted_wins:,} ({(1 - summary.submitted_win_rate) * 100:.2f}%)")
+        f"    {b_path.name} wins: {summary.rounds - summary.submitted_wins:,} ({(1 - summary.submitted_win_rate) * 100:.2f}%)")
     print()
     print(f"    Result:            {status}")
     print(f"    {explanation}")
     print()
 
-    # Timeout info
     if summary.submitted_timed_out or summary.leaderboard_timed_out:
         print(f"  {Colors.BOLD}Timeouts:{Colors.RESET}")
         if summary.submitted_timed_out:
-            print_warning(f"    Bot A exceeded time limit and defaulted to 0 for remaining moves")
+            print_warning(f"{a_path.name} exceeded time limit and defaulted to 0 for remaining moves")
         if summary.leaderboard_timed_out:
-            print_warning(f"    Bot B exceeded time limit and defaulted to 0 for remaining moves")
+            print_warning(f"{b_path.name} exceeded time limit and defaulted to 0 for remaining moves")
         print()
 
     print(f"  {Colors.BOLD}Performance:{Colors.RESET}")
-    print(f"    Bot A time:        {summary.submitted_time_seconds:.3f}s")
-    print(f"    Bot B time:        {summary.leaderboard_time_seconds:.3f}s")
+    print(f"    {a_path.name} time: {summary.submitted_time_seconds:.3f}s")
+    print(f"    {b_path.name} time: {summary.leaderboard_time_seconds:.3f}s")
     print(f"    Total wall time:   {summary.wall_time_seconds:.3f}s")
-    print()
-    print(f"  {Colors.DIM}Seed: {seed}{Colors.RESET}")
-    print(f"  {Colors.DIM}To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}{Colors.RESET}")
     print()
 
     return 0

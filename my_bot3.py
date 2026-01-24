@@ -89,7 +89,7 @@ class MyBot:
         #   - Detect if opponent is mirroring you
         #   - Use more sophisticated pattern matching
 
-        return last_opponent_move
+        return 1 #last_opponent_move
 
 
 def create_bot(seed: int):
