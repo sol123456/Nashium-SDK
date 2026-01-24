@@ -2,8 +2,7 @@
 """
 Runner script for sandboxed bot execution.
 Communicates via JSON over stdin/stdout.
-
-This runs inside Docker containers or subprocesses.
+Maintains game state internally to minimize IPC overhead.
 """
 from __future__ import annotations
 
@@ -22,6 +21,49 @@ class RoundState:
     opponent_history: tuple[int, ...]
 
 
+class BotRunner:
+    """Manages bot instance and game state."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.my_history: list[int] = []
+        self.opponent_history: list[int] = []
+        self.round_index: int = 0
+
+    def reset(self) -> None:
+        """Reset state for a new match."""
+        self.my_history.clear()
+        self.opponent_history.clear()
+        self.round_index = 0
+
+    def make_move(self, opponent_last_move: int | None) -> tuple[int, float]:
+        """
+        Process opponent's last move and generate our move.
+        Returns (move, time_taken).
+        """
+        # Record opponent's last move (if not first round)
+        if opponent_last_move is not None:
+            self.opponent_history.append(opponent_last_move)
+
+        # Build state
+        state = RoundState(
+            round_index=self.round_index,
+            my_history=tuple(self.my_history),
+            opponent_history=tuple(self.opponent_history),
+        )
+
+        # Get move with timing
+        start = time.perf_counter()
+        move = int(self.bot.move(state))
+        elapsed = time.perf_counter() - start
+
+        # Record our move
+        self.my_history.append(move)
+        self.round_index += 1
+
+        return move, elapsed
+
+
 def send(data: dict) -> None:
     """Send JSON response to stdout."""
     print(json.dumps(data), flush=True)
@@ -34,29 +76,26 @@ def recv() -> dict | None:
         if not line:
             return None
         return json.loads(line.strip())
-    except:
+    except Exception as e:
+        send({"status": "error", "error": f"Failed to read input: {e}"})
         return None
 
 
 def load_bot(code: str):
     """Load and instantiate a bot from source code."""
     namespace = {"__name__": "__bot__"}
-
-    # Inject RoundState so bots can use it
     namespace["RoundState"] = RoundState
 
     exec(compile(code, "<bot>", "exec"), namespace)
 
-    # Look for Bot class
     bot_class = namespace.get("Bot")
 
     if bot_class is None:
-        # Find any class with a move method
         for name, obj in namespace.items():
             if (
-                isinstance(obj, type)
-                and callable(getattr(obj, "move", None))
-                and name not in ("RoundState",)
+                    isinstance(obj, type)
+                    and callable(getattr(obj, "move", None))
+                    and name != "RoundState"
             ):
                 bot_class = obj
                 break
@@ -69,16 +108,8 @@ def load_bot(code: str):
     return bot_class()
 
 
-def run_move(bot, state: RoundState) -> tuple[int, float]:
-    """Execute a single move and return (move, time_taken)."""
-    start = time.perf_counter()
-    move = int(bot.move(state))
-    elapsed = time.perf_counter() - start
-    return move, elapsed
-
-
 def main():
-    bot = None
+    runner: BotRunner | None = None
 
     while True:
         cmd = recv()
@@ -93,6 +124,7 @@ def main():
         elif command == "load":
             try:
                 bot = load_bot(cmd["code"])
+                runner = BotRunner(bot)
                 send({"status": "ok"})
             except Exception as e:
                 send({
@@ -100,18 +132,22 @@ def main():
                     "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 })
 
+        elif command == "reset":
+            if runner is None:
+                send({"status": "error", "error": "Bot not loaded"})
+            else:
+                runner.reset()
+                send({"status": "ok"})
+
         elif command == "move":
-            if bot is None:
+            if runner is None:
                 send({"status": "error", "error": "Bot not loaded"})
                 continue
 
             try:
-                state = RoundState(
-                    round_index=cmd["round_index"],
-                    my_history=tuple(cmd["my_history"]),
-                    opponent_history=tuple(cmd["opponent_history"]),
-                )
-                move, elapsed = run_move(bot, state)
+                # Only receive opponent's last move, not full history
+                opponent_last = cmd.get("opponent_last")  # None for first round
+                move, elapsed = runner.make_move(opponent_last)
                 send({"status": "ok", "move": move, "time": elapsed})
             except Exception as e:
                 send({

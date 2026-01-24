@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import signal
 import subprocess
-import tempfile
+import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
 
-from ..core.engine import RoundState
-from ..core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
+from ..core import RoundState, BotLoadError, InvalidMoveError
+from ..core.errors import BotRuntimeError
 
 
 @dataclass
 class SandboxConfig:
     """Configuration for sandboxed bot execution."""
-
     docker_image: str = "nashium-runner:latest"
     memory_limit: str = "256m"
     cpu_limit: float = 1.0
@@ -23,155 +24,239 @@ class SandboxConfig:
     network_enabled: bool = False
     time_limit: float = 100.0
     read_only_root: bool = True
-    # Per-move timeout (prevents infinite loops on single move)
     move_timeout: float = 5.0
 
 
-class DockerExecutor:
-    """Executes a bot inside a Docker container.
+class SubprocessExecutor:
+    """
+    Executes a bot in a subprocess.
 
-    Provides strong isolation and resource limits for untrusted code.
-
-    Usage:
-        with DockerExecutor(bot_source_code, config) as executor:
-            summary = run_match_with_executors(executor, other_executor, match_config)
+    Uses delta-based protocol to minimize IPC overhead.
+    Uses thread-based timeout for reliable cross-platform behavior.
     """
 
     def __init__(
-        self,
-        bot_code: str,
-        config: SandboxConfig | None = None,
-        *,
-        container_name: str | None = None,
+            self,
+            bot_code: str,
+            time_limit: float = 100.0,
+            move_timeout: float = 5.0,
+            python_executable: str | None = None,
     ):
-        self._config = config or SandboxConfig()
+        self._time_limit = time_limit
+        self._move_timeout = move_timeout
         self._elapsed_time = 0.0
         self._timed_out = False
         self._closed = False
+        self._python = python_executable or sys.executable
         self._process: subprocess.Popen | None = None
-        self._container_name = container_name
 
-        self._start_container(bot_code)
+        # Queue for receiving responses from reader thread
+        self._response_queue: queue.Queue = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._stop_reader = threading.Event()
 
-    def _build_docker_command(self) -> list[str]:
-        """Build the docker run command with security options."""
-        cmd = [
-            "docker", "run",
-            "--rm",
-            "-i",
-            "--memory", self._config.memory_limit,
-            "--memory-swap", self._config.memory_limit,  # Disable swap
-            f"--cpus={self._config.cpu_limit}",
-            f"--pids-limit={self._config.pids_limit}",
-            "--security-opt=no-new-privileges:true",
-        ]
+        self._start_process(bot_code)
 
-        if self._config.read_only_root:
-            cmd.append("--read-only")
-            # Need a writable /tmp for Python
-            cmd.extend(["--tmpfs", "/tmp:size=32m,mode=1777"])
+    def _start_process(self, bot_code: str) -> None:
+        """Start subprocess with the runner script."""
+        runner_path = Path(__file__).parent / "_subprocess_runner.py"
 
-        if not self._config.network_enabled:
-            cmd.append("--network=none")
+        if not runner_path.exists():
+            raise FileNotFoundError(f"Runner script not found: {runner_path}")
 
-        if self._container_name:
-            cmd.extend(["--name", self._container_name])
+        # Create subprocess with new session on Unix for clean termination
+        kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "bufsize": 1,
+        }
 
-        cmd.append(self._config.docker_image)
-        return cmd
+        # On Unix, create new process group for clean kills
+        if hasattr(os, "setsid"):
+            kwargs["start_new_session"] = True
 
-    def _start_container(self, bot_code: str) -> None:
-        """Start the Docker container and load the bot."""
-        cmd = self._build_docker_command()
+        self._process = subprocess.Popen(
+            [self._python, "-u", str(runner_path)],
+            **kwargs
+        )
 
-        try:
-            self._process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
+        # Start reader thread
+        self._start_reader_thread()
 
-            # Send bot code to load
-            self._send({"cmd": "load", "code": bot_code})
-            response = self._recv(timeout=10.0)
+        # Load bot with timeout
+        self._send({"cmd": "load", "code": bot_code})
+        response = self._recv(timeout=10.0)
 
-            if response.get("status") != "ok":
-                error = response.get("error", "Unknown error loading bot")
-                raise BotLoadError(f"Failed to load bot: {error}")
-
-        except FileNotFoundError:
-            raise BotLoadError("Docker is not installed or not in PATH")
-        except BotLoadError:
+        if response.get("status") != "ok":
+            error_msg = response.get("error", "Failed to load bot")
             self.close()
-            raise
-        except Exception as e:
-            self.close()
-            raise BotLoadError(f"Failed to start container: {e}")
+            raise BotLoadError(error_msg)
+
+    def _start_reader_thread(self) -> None:
+        """Start background thread that reads from subprocess stdout."""
+
+        def reader_loop():
+            while not self._stop_reader.is_set():
+                if self._process is None or self._process.stdout is None:
+                    break
+
+                try:
+                    line = self._process.stdout.readline()
+                    if not line:
+                        # EOF - process terminated
+                        self._response_queue.put(("eof", None))
+                        break
+                    self._response_queue.put(("ok", line))
+                except Exception as e:
+                    self._response_queue.put(("error", str(e)))
+                    break
+
+        self._reader_thread = threading.Thread(target=reader_loop, daemon=True)
+        self._reader_thread.start()
 
     def _send(self, data: dict) -> None:
-        """Send JSON message to container stdin."""
+        """Send JSON message to subprocess."""
         if self._process is None or self._process.stdin is None:
-            raise BotRuntimeError("Container not running", RuntimeError())
+            raise BotRuntimeError("Process not running", RuntimeError())
 
         try:
             line = json.dumps(data) + "\n"
             self._process.stdin.write(line)
             self._process.stdin.flush()
-        except BrokenPipeError as e:
-            raise BotRuntimeError("Container process terminated", e)
+        except (BrokenPipeError, OSError) as e:
+            self._kill_process()
+            raise BotRuntimeError("Process terminated unexpectedly", e)
 
     def _recv(self, timeout: float | None = None) -> dict:
-        """Receive JSON message from container stdout."""
-        if self._process is None or self._process.stdout is None:
-            raise BotRuntimeError("Container not running", RuntimeError())
-
-        import select
-
-        timeout = timeout or self._config.move_timeout
-
-        # Use select for timeout on Unix, fall back to blocking on Windows
-        if hasattr(select, "select"):
-            ready, _, _ = select.select([self._process.stdout], [], [], timeout)
-            if not ready:
-                self.close()
-                raise BotRuntimeError(
-                    f"Container timed out after {timeout}s", TimeoutError()
-                )
-
-        line = self._process.stdout.readline()
-
-        if not line:
-            stderr = ""
-            if self._process.stderr:
-                stderr = self._process.stderr.read()
-            raise BotRuntimeError(
-                f"Container terminated unexpectedly: {stderr.strip()}", RuntimeError()
-            )
+        """Receive JSON message from subprocess with timeout."""
+        timeout = timeout if timeout is not None else self._move_timeout
 
         try:
-            return json.loads(line)
-        except json.JSONDecodeError as e:
-            raise BotRuntimeError(f"Invalid JSON from container: {line!r}", e)
+            status, data = self._response_queue.get(timeout=timeout)
+        except queue.Empty:
+            # Timeout - kill the process
+            self._kill_process()
+            self._timed_out = True
+            raise BotRuntimeError(
+                f"Move timed out after {timeout}s - process killed",
+                TimeoutError()
+            )
 
-    def get_move(self, state: RoundState) -> int:
-        """Get the bot's move for the given state."""
+        if status == "eof":
+            stderr = self._get_stderr()
+            self._kill_process()
+            raise BotRuntimeError(
+                f"Process terminated unexpectedly. stderr: {stderr}",
+                RuntimeError()
+            )
+
+        if status == "error":
+            self._kill_process()
+            raise BotRuntimeError(f"Read error: {data}", RuntimeError())
+
+        # status == "ok", data is the line
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError as e:
+            raise BotRuntimeError(f"Invalid JSON from process: {data!r}", e)
+
+    def _get_stderr(self) -> str:
+        """Get stderr output from process (non-blocking)."""
+        if self._process is None or self._process.stderr is None:
+            return ""
+        try:
+            # Set non-blocking and read what's available
+            import select
+            if hasattr(select, "select"):
+                ready, _, _ = select.select([self._process.stderr], [], [], 0.1)
+                if ready:
+                    return self._process.stderr.read(4096)
+            return ""
+        except:
+            return ""
+
+    def _kill_process(self) -> None:
+        """Forcefully kill the subprocess."""
+        if self._process is None:
+            return
+
+        self._stop_reader.set()
+
+        pid = self._process.pid
+
+        # Try terminate first
+        try:
+            self._process.terminate()
+        except:
+            pass
+
+        # Give it a moment
+        try:
+            self._process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Force kill
+        try:
+            self._process.kill()
+        except:
+            pass
+
+        # On Unix, kill the entire process group
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        # Wait for process to actually die
+        try:
+            self._process.wait(timeout=1)
+        except:
+            pass
+
+        # Close file handles
+        for stream in [self._process.stdin, self._process.stdout, self._process.stderr]:
+            if stream:
+                try:
+                    stream.close()
+                except:
+                    pass
+
+    def get_move(self, opponent_last_move: int | None) -> int:
+        """
+        Get the bot's next move.
+
+        Args:
+            opponent_last_move: The opponent's last move (None for first round)
+
+        Returns:
+            The bot's move (0 or 1), or 0 if timed out
+        """
         if self._timed_out:
             return 0
 
         if self._closed:
-            raise BotRuntimeError("Executor is closed", RuntimeError())
+            return 0
 
-        self._send({
-            "cmd": "move",
-            "round_index": state.round_index,
-            "my_history": list(state.my_history),
-            "opponent_history": list(state.opponent_history),
-        })
+        # Check if we've exceeded total time limit
+        if self._elapsed_time > self._time_limit:
+            self._timed_out = True
+            return 0
 
-        response = self._recv()
+        # Send move request
+        msg = {"cmd": "move"}
+        if opponent_last_move is not None:
+            msg["opponent_last"] = opponent_last_move
+
+        try:
+            self._send(msg)
+            response = self._recv()
+        except BotRuntimeError:
+            self._timed_out = True
+            return 0
 
         if response.get("status") == "error":
             raise BotRuntimeError(response.get("error", "Unknown error"), RuntimeError())
@@ -180,16 +265,29 @@ class DockerExecutor:
         elapsed = response.get("time", 0.0)
         self._elapsed_time += elapsed
 
-        if self._elapsed_time > self._config.time_limit:
+        if self._elapsed_time > self._time_limit:
             self._timed_out = True
 
         if move not in (0, 1):
             raise InvalidMoveError(
-                f"Bot returned invalid move {move!r} on round {state.round_index}. "
-                "Expected 0 or 1."
+                f"Bot returned invalid move {move!r}. Expected 0 or 1."
             )
 
         return move
+
+    def reset(self) -> None:
+        """Reset the bot state for a new match."""
+        if self._closed or self._process is None:
+            return
+
+        try:
+            self._send({"cmd": "reset"})
+            self._recv(timeout=1.0)
+        except:
+            pass
+
+        self._elapsed_time = 0.0
+        self._timed_out = False
 
     @property
     def elapsed_time(self) -> float:
@@ -200,138 +298,27 @@ class DockerExecutor:
         return self._timed_out
 
     def close(self) -> None:
-        """Terminate the container and clean up resources."""
+        """Terminate the subprocess and clean up resources."""
         if self._closed:
             return
 
         self._closed = True
+        self._stop_reader.set()
 
         if self._process is None:
             return
 
         # Try graceful shutdown
         try:
-            if self._process.stdin:
+            if self._process.stdin and not self._process.stdin.closed:
                 self._process.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
                 self._process.stdin.flush()
-            self._process.wait(timeout=1)
+            self._process.wait(timeout=0.5)
         except:
             pass
 
-        # Force kill if needed
-        try:
-            self._process.terminate()
-            self._process.wait(timeout=1)
-        except:
-            pass
-
-        try:
-            self._process.kill()
-            self._process.wait(timeout=1)
-        except:
-            pass
-
-    def __enter__(self) -> "DockerExecutor":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-
-class SubprocessExecutor:
-    """Executes a bot in a subprocess without Docker.
-
-    Less secure than DockerExecutor but useful for testing
-    or environments without Docker.
-    """
-
-    def __init__(
-        self,
-        bot_code: str,
-        time_limit: float = float("inf"),
-        python_executable: str | None = None,
-    ):
-        self._time_limit = time_limit
-        self._elapsed_time = 0.0
-        self._timed_out = False
-        self._closed = False
-        self._python = python_executable or "python"
-
-        self._start_process(bot_code)
-
-    def _start_process(self, bot_code: str) -> None:
-        """Start subprocess with the runner script."""
-        runner_path = Path(__file__).parent / "_subprocess_runner.py"
-
-        self._process = subprocess.Popen(
-            [self._python, "-u", str(runner_path)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-        self._send({"cmd": "load", "code": bot_code})
-        response = self._recv()
-
-        if response.get("status") != "ok":
-            self.close()
-            raise BotLoadError(response.get("error", "Failed to load bot"))
-
-    def _send(self, data: dict) -> None:
-        if self._process.stdin:
-            self._process.stdin.write(json.dumps(data) + "\n")
-            self._process.stdin.flush()
-
-    def _recv(self) -> dict:
-        if self._process.stdout:
-            line = self._process.stdout.readline()
-            if line:
-                return json.loads(line)
-        return {"status": "error", "error": "Process terminated"}
-
-    def get_move(self, state: RoundState) -> int:
-        if self._timed_out:
-            return 0
-
-        self._send({
-            "cmd": "move",
-            "round_index": state.round_index,
-            "my_history": list(state.my_history),
-            "opponent_history": list(state.opponent_history),
-        })
-
-        response = self._recv()
-
-        if response.get("status") == "error":
-            raise BotRuntimeError(response.get("error", "Unknown"), RuntimeError())
-
-        move = response.get("move", 0)
-        self._elapsed_time += response.get("time", 0.0)
-
-        if self._elapsed_time > self._time_limit:
-            self._timed_out = True
-
-        return move
-
-    @property
-    def elapsed_time(self) -> float:
-        return self._elapsed_time
-
-    @property
-    def timed_out(self) -> bool:
-        return self._timed_out
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._process.terminate()
-            self._process.wait(timeout=1)
-        except:
-            self._process.kill()
+        # Force kill
+        self._kill_process()
 
     def __enter__(self) -> "SubprocessExecutor":
         return self

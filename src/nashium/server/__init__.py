@@ -1,7 +1,6 @@
-from .sandbox import DockerExecutor, SubprocessExecutor, SandboxConfig
+from .sandbox import SubprocessExecutor, SandboxConfig
 
 __all__ = [
-    "DockerExecutor",
     "SubprocessExecutor",
     "SandboxConfig",
 ]

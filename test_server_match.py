@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """Test script for server-side match execution."""
 
+import time
 from nashium.server.match_runner import run_match_from_code
 from nashium.core import MatchConfig
 
-# Sample bot 1: Always plays 0
 BOT_ALWAYS_ZERO = """
 class Bot:
     def move(self, state):
         return 0
 """
 
-# Sample bot 2: Always plays 1
 BOT_ALWAYS_ONE = """
 class Bot:
     def move(self, state):
         return 1
 """
 
-# Sample bot 3: Random
 BOT_RANDOM = """
 import random
-
 class Bot:
     def move(self, state):
         return random.randint(0, 1)
 """
 
-# Sample bot 4: Tit-for-tat (copy opponent's last move)
 BOT_TIT_FOR_TAT = """
 class Bot:
     def move(self, state):
@@ -36,58 +32,122 @@ class Bot:
         return state.opponent_history[-1]
 """
 
-# Sample bot 5: Anti-tit-for-tat (opposite of opponent's last move)
-BOT_ANTI_TIT_FOR_TAT = """
+BOT_INFINITE_LOOP = """
 class Bot:
     def move(self, state):
-        if not state.opponent_history:
-            return 0
-        return 1 - state.opponent_history[-1]
+        while True:
+            pass
+        return 0
+"""
+
+BOT_SLOW = """
+import time
+class Bot:
+    def move(self, state):
+        time.sleep(0.1)
+        return 0
 """
 
 
-def main():
-    # Use fewer rounds for quick testing
-    config = MatchConfig(rounds=10000)
-
+def test_basic():
     print("=" * 60)
-    print("Test 1: Always-Zero vs Always-One")
+    print("Test 1: Quick sanity check (100 rounds)")
     print("=" * 60)
+    config = MatchConfig(rounds=100)
+    start = time.perf_counter()
     result = run_match_from_code(BOT_ALWAYS_ZERO, BOT_ALWAYS_ONE, config)
+    elapsed = time.perf_counter() - start
     print(f"Result: {result.result}")
     print(f"Submitted wins: {result.submitted_wins}/{result.rounds}")
-    print(f"Win rate: {result.submitted_win_rate:.2%}")
-    print(f"Submitted time: {result.submitted_time_seconds:.4f}s")
-    print(f"Leaderboard time: {result.leaderboard_time_seconds:.4f}s")
+    print(f"Wall time: {elapsed:.3f}s")
     print()
 
+
+def test_performance():
     print("=" * 60)
-    print("Test 2: Tit-for-Tat vs Random")
+    print("Test 2: Performance test (10,000 rounds)")
     print("=" * 60)
+    config = MatchConfig(rounds=10_000)
+    start = time.perf_counter()
+    result = run_match_from_code(BOT_ALWAYS_ZERO, BOT_ALWAYS_ONE, config)
+    elapsed = time.perf_counter() - start
+    print(f"Result: {result.result}")
+    print(f"Submitted wins: {result.submitted_wins}/{result.rounds}")
+    print(f"Wall time: {elapsed:.3f}s")
+    print(f"Rounds per second: {result.rounds / elapsed:.0f}")
+    print()
+
+
+def test_tit_for_tat():
+    print("=" * 60)
+    print("Test 3: Tit-for-tat vs Random (1000 rounds)")
+    print("=" * 60)
+    config = MatchConfig(rounds=1000)
     result = run_match_from_code(BOT_TIT_FOR_TAT, BOT_RANDOM, config)
     print(f"Result: {result.result}")
     print(f"Submitted wins: {result.submitted_wins}/{result.rounds}")
     print(f"Win rate: {result.submitted_win_rate:.2%}")
     print()
 
+
+def test_infinite_loop():
     print("=" * 60)
-    print("Test 3: Random vs Random")
+    print("Test 4: Timeout handling - infinite loop bot")
     print("=" * 60)
-    result = run_match_from_code(BOT_RANDOM, BOT_RANDOM, config)
-    print(f"Result: {result.result}")
-    print(f"Submitted wins: {result.submitted_wins}/{result.rounds}")
-    print(f"Win rate: {result.submitted_win_rate:.2%}")
+
+    # Short move timeout (2s) to make test faster
+    from nashium.server.sandbox import SubprocessExecutor
+    from nashium.core import MatchConfig, InteractionResult
+
+    config = MatchConfig(rounds=10)
+    start = time.perf_counter()
+
+    try:
+        # Manually create executor with short move timeout
+        with SubprocessExecutor(BOT_INFINITE_LOOP, time_limit=100.0, move_timeout=2.0) as submitted:
+            with SubprocessExecutor(BOT_ALWAYS_ZERO, time_limit=100.0, move_timeout=2.0) as leaderboard:
+                # Try to get moves
+                for i in range(10):
+                    s_move = submitted.get_move(None if i == 0 else 0)
+                    l_move = leaderboard.get_move(None if i == 0 else s_move)
+                    print(f"Round {i}: submitted={'timed_out' if submitted.timed_out else s_move}")
+                    if submitted.timed_out:
+                        break
+
+        elapsed = time.perf_counter() - start
+        print(f"Submitted timed out: {submitted.timed_out}")
+        print(f"Wall time: {elapsed:.3f}s (expected ~2s)")
+        print("SUCCESS: Process was killed properly!")
+
+    except Exception as e:
+        elapsed = time.perf_counter() - start
+        print(f"Exception: {type(e).__name__}: {e}")
+        print(f"Wall time: {elapsed:.3f}s")
     print()
 
+
+def test_slow_bot():
     print("=" * 60)
-    print("Test 4: Longer match (1000 rounds)")
+    print("Test 5: Cumulative timeout - slow bot")
     print("=" * 60)
-    config_long = MatchConfig(rounds=1000)
-    result = run_match_from_code(BOT_ANTI_TIT_FOR_TAT, BOT_TIT_FOR_TAT, config_long)
+    # Bot sleeps 100ms per move, limit is 0.5s = should timeout after ~5 moves
+    config = MatchConfig(rounds=100, max_total_time_seconds_per_bot=2)
+    start = time.perf_counter()
+    result = run_match_from_code(BOT_SLOW, BOT_ALWAYS_ZERO, config)
+    elapsed = time.perf_counter() - start
     print(f"Result: {result.result}")
-    print(f"Submitted wins: {result.submitted_wins}/{result.rounds}")
-    print(f"Win rate: {result.submitted_win_rate:.2%}")
-    print(f"Wall time: {result.wall_time_seconds:.4f}s")
+    print(f"Submitted timed out: {result.submitted_timed_out}")
+    print(f"Submitted time: {result.submitted_time_seconds:.3f}s")
+    print(f"Wall time: {elapsed:.3f}s")
+    print()
+
+
+def main():
+    test_basic()
+    test_performance()
+    test_tit_for_tat()
+    test_infinite_loop()
+    test_slow_bot()
 
 
 if __name__ == "__main__":
