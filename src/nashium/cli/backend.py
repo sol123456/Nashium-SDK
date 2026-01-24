@@ -17,6 +17,7 @@ from ..core import (
     MatchTrace,
     run_match,
     run_match_trace,
+    RoundState,
 )
 
 
@@ -59,10 +60,16 @@ class Backend(ABC):
 
 def _load_bot_from_source(source: str, seed: int):
     """Load a bot instance from source code string."""
-    namespace = {"__name__": "__bot__"}
+    namespace = {
+        "__name__": "__bot__",
+        "RoundState": RoundState,  # ← Add this import!
+    }
     exec(compile(source, "<bot>", "exec"), namespace)
 
+    # Look for Bot class first (user bots)
     bot_class = namespace.get("Bot")
+
+    # If not found, look for any class with a move method (sample bots)
     if bot_class is None:
         for name, obj in namespace.items():
             if (
@@ -76,14 +83,14 @@ def _load_bot_from_source(source: str, seed: int):
     if bot_class is None:
         raise ValueError("No bot class found in source code")
 
-    # Try instantiation with seed
+    # Try instantiation with seed (now that sample bots accept it!)
     try:
-        return bot_class(seed)
+        return bot_class(seed=seed)  # ← Try keyword first (most explicit)
     except TypeError:
         try:
-            return bot_class(seed=seed)
+            return bot_class(seed)  # ← Then positional
         except TypeError:
-            return bot_class()
+            return bot_class()  # ← Finally no args (shouldn't happen now)
 
 
 class LocalBackend(Backend):

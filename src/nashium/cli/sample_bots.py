@@ -13,12 +13,18 @@ from ..core import RoundState
 class AlwaysHeads:
     """Always plays 0 (Heads). Trivial to beat."""
 
+    def __init__(self, seed: int = None):
+        pass  # No randomness needed
+
     def move(self, state: RoundState) -> int:
         return 0
 
 
 class AlwaysTails:
     """Always plays 1 (Tails). Trivial to beat."""
+
+    def __init__(self, seed: int = None):
+        pass
 
     def move(self, state: RoundState) -> int:
         return 1
@@ -27,12 +33,18 @@ class AlwaysTails:
 class Alternator:
     """Alternates between 0 and 1 each round. Predictable."""
 
+    def __init__(self, seed: int = None):
+        pass
+
     def move(self, state: RoundState) -> int:
         return state.round_index % 2
 
 
 class MirrorOpponent:
     """Copies what you played last round."""
+
+    def __init__(self, seed: int = None):
+        pass
 
     def move(self, state: RoundState) -> int:
         if not state.opponent_history:
@@ -42,6 +54,9 @@ class MirrorOpponent:
 
 class FrequencyCounter:
     """Plays whatever you've played most often."""
+
+    def __init__(self, seed: int = None):
+        pass
 
     def move(self, state: RoundState) -> int:
         if not state.opponent_history:
@@ -54,51 +69,11 @@ class FrequencyCounter:
 class RandomBot:
     """Plays randomly. Used for determinism testing."""
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int = None):  # ← Make optional with default
         self.rng = random.Random(seed)
 
     def move(self, state: RoundState) -> int:
         return self.rng.randint(0, 1)
-
-
-def sample_leaderboard_bots(seed: int) -> list[tuple[str, object]]:
-    """
-    Returns the sample bots used for local qualification testing.
-    These are intentionally simple - the real leaderboard bots will be harder!
-
-    Note: RandomBot is NOT included here because you can't reliably beat true random.
-    """
-    return [
-        ("always_heads", AlwaysHeads()),
-        ("always_tails", AlwaysTails()),
-        ("alternator", Alternator()),
-        ("mirror", MirrorOpponent()),
-        ("frequency_counter", FrequencyCounter()),
-    ]
-
-
-# Type alias for bot factory functions
-BotFactory = Callable[[int], object]
-
-
-def determinism_test_bot_factories() -> list[tuple[str, BotFactory]]:
-    """
-    Returns FACTORIES for bots used in determinism testing.
-
-    We return factories (functions that create bots) instead of instances
-    because each test run needs a FRESH bot instance. If we reused the same
-    RandomBot instance, its internal RNG state would be different on the
-    second run, causing false "not deterministic" results.
-
-    Includes RandomBot because it's the most important for catching non-determinism
-    in the user's bot - if their bot uses unseeded randomness, it will produce
-    different moves against the same random opponent sequence.
-    """
-    return [
-        ("always_heads", lambda seed: AlwaysHeads()),
-        ("alternator", lambda seed: Alternator()),
-        ("random", lambda seed: RandomBot(seed)),  # Most important for determinism!
-    ]
 
 
 ###################################################################################################################
@@ -118,8 +93,6 @@ def _get_bot_source(bot_class: type) -> str:
 def sample_leaderboard_bot_sources() -> list[tuple[str, str]]:
     """
     Returns (name, source_code) for sample leaderboard bots.
-
-    Used by SandboxBackend where we need source code rather than instances.
     """
     return [
         ("always_heads", _get_bot_source(AlwaysHeads)),
@@ -133,11 +106,11 @@ def sample_leaderboard_bot_sources() -> list[tuple[str, str]]:
 def determinism_test_bot_sources() -> list[tuple[str, str]]:
     """
     Returns (name, source_code) for determinism testing bots.
-
-    Used by SandboxBackend where we need source code rather than instances.
     """
     return [
         ("always_heads", _get_bot_source(AlwaysHeads)),
+        ("always_tails", _get_bot_source(AlwaysTails)),
+        ("mirror_opponent", _get_bot_source(MirrorOpponent)),
         ("alternator", _get_bot_source(Alternator)),
         ("random", _get_bot_source(RandomBot)),
     ]

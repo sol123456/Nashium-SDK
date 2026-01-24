@@ -74,7 +74,7 @@ class MyBot:
         """
         # Round 0: No history yet, just guess
         if state.round_index == 0:
-            return random.choice([0, 1])
+            return self.rng.choice([0, 1])
 
 
 
@@ -89,7 +89,7 @@ class MyBot:
         #   - Detect if opponent is mirroring you
         #   - Use more sophisticated pattern matching
 
-        return 1 #last_opponent_move
+        return self.rng.choice([0, 1]) #last_opponent_move
 
 
 def create_bot(seed: int):
