@@ -12,9 +12,15 @@ pip install -e .
 
 ---
 
-## Quick Start
+## Usage Guide
 
-### 1. Create a Bot
+This section walks through the full workflow and documents all available commands.
+
+---
+
+### Create a Bot
+
+Create a new bot from the template:
 
 ```bash
 nashium scaffold my_bot.py
@@ -24,7 +30,7 @@ This creates a template bot file with documentation and a simple strategy to get
 
 ---
 
-### 2. Test Your Bot
+### Test Your Bot (Qualification)
 
 Run the qualifier to test against sample opponents:
 
@@ -34,7 +40,7 @@ nashium qualify my_bot.py
 
 This will:
 
-- Check that your bot is deterministic  
+- Check that your bot is deterministic
 - Run matches against sample opponents:
   - always_heads
   - always_tails
@@ -43,79 +49,73 @@ This will:
   - frequency_counter
 - Report whether you qualify (must exceed **51.55% win rate**)
 
----
-
-### 3. Check Determinism
+Additional examples:
 
 ```bash
-nashium check my_bot.py
-```
-
----
-
-### 4. Run Head-to-Head Matches
-
-```bash
-nashium run bot_a.py bot_b.py
-```
-
----
-
-## Commands
-
-### nashium scaffold <path>
-
-```bash
-nashium scaffold my_bot.py
-```
-
----
-
-### nashium qualify <bot>
-
-```bash
-nashium qualify my_bot.py
 nashium qualify my_bot.py --seed 12345
 nashium qualify my_bot.py --rounds 5000
 ```
 
-Options:
-
-- `--seed <int>` – Use a specific seed
-- `--rounds <int>` – Rounds per match (default, server value: 10,000)
-- `--time-budget <float>` – Time limit in seconds (default, server value: 100)
-
 ---
 
-### nashium check <bot>
+### Check Determinism
+
+Verify that your bot behaves deterministically:
 
 ```bash
 nashium check my_bot.py
 nashium check my_bot.py --seed 12345
 ```
 
-Options:
-
-- `--seed <int>`
-- `--rounds <int>`
-- `--time-budget <float>`
-
 ---
 
-### nashium run <bot_a> <bot_b>
+### Run Head-to-Head Matches
+
+Run a match between two bots:
 
 ```bash
 nashium run bot_a.py bot_b.py
 nashium run bot_a.py bot_b.py --seed 12345
-nashium run bot_a.py bot_b.py --invert-opponent
 ```
 
-Options:
+---
 
-- `--seed <int>`
-- `--rounds <int>`
-- `--invert-opponent`
-- `--time-budget <float>`
+## Common Options
+
+The following options are shared by **check**, **run**, and **qualify**:
+
+- `--rounds <int>`  
+  Number of rounds per match.  
+  Defaults:
+  - `check`: 2,000  
+  - `run`, `qualify`: 10,000 (server default)
+
+- `--seed <int>`  
+  Use a specific random seed for reproducibility.
+
+- `--time-budget <float>`  
+  Total time limit in seconds.  
+  Default (and server value): **100.0 seconds**
+
+- `--sandbox`  
+  Run the bot in a sandboxed subprocess.
+
+---
+
+## Sandbox vs Local Execution
+
+By default, bots are executed locally (unsandboxed):
+
+- Fast execution
+- Easy debugging
+- Unsafe or hanging code may crash or block the process
+
+When `--sandbox` is enabled:
+
+- Execution matches the server environment exactly
+- Handles unsafe code, infinite loops, and hangs safely
+- Slower due to process isolation
+- Recommended for final testing before submission
 
 ---
 
@@ -127,7 +127,7 @@ Your bot must:
 - Implement `move(state: RoundState) -> int`
 - Return `0` or `1`
 - Be deterministic
-- Complete within 100 seconds total
+- Complete within the time budget
 
 ---
 
@@ -162,12 +162,13 @@ def create_bot(seed: int):
 
 ## Time Limit Behavior
 
-Each bot has **100 seconds total**.
+Each bot has a **100 second total** time budget.
 
 If exceeded:
-- Match continues
-- Bot defaults to `0`
-- Almost always loses
+
+- The match continues
+- The bot defaults to returning `0`
+- This almost always results in a loss
 
 ---
 
@@ -187,6 +188,7 @@ nashium run bot_a.py bot_b.py --seed 1234567890
 Local qualification is indicative only.
 
 Server results may differ due to:
+
 - Different seeds
 - Hardware differences
 - Execution timing
