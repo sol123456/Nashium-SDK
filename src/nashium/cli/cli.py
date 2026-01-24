@@ -5,7 +5,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from .client import NashiumClient, NashiumClientConfig
+
 from nashium.core.engine import InteractionResult, MatchConfig, run_match, run_match_trace
 from nashium.core.errors import BotLoadError, BotTimeoutError, InvalidMoveError
 from .loading import load_bot_from_file
@@ -493,70 +493,6 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 3
 
 
-# ============================================================================
-# SEED COMMAND
-# ============================================================================
-
-def cmd_seed(args: argparse.Namespace) -> int:
-    a_path = Path(args.bot_a)
-    b_path = Path(args.bot_b)
-
-    if not a_path.exists():
-        _print_failure(f"File not found: {a_path}")
-        return 1
-    if not b_path.exists():
-        _print_failure(f"File not found: {b_path}")
-        return 1
-
-    seed = stable_seed(_read_bytes(a_path), _read_bytes(b_path))
-    print(f"Seed for {a_path.name} vs {b_path.name}: {seed}")
-    return 0
-
-
-# ============================================================================
-# UPLOAD COMMAND
-# ============================================================================
-
-def cmd_upload(args: argparse.Namespace) -> int:
-    bot_path = Path(args.bot)
-
-    if not bot_path.exists():
-        _print_failure(f"Bot file not found: {bot_path}")
-        return 1
-
-    _print_header(f"Uploading: {args.name}")
-
-    code = bot_path.read_text(encoding="utf-8")
-
-    client = NashiumClient(
-        NashiumClientConfig(
-            base_url=args.base_url,
-            bearer_token=args.token,
-            timeout_seconds=args.timeout_seconds,
-        )
-    )
-
-    payload = {
-        "name": args.name,
-        "code": code,
-    }
-
-    try:
-        resp = client.request_json("POST", args.endpoint, payload=payload)
-        _print_success("Bot uploaded successfully!")
-        print()
-        if resp:
-            if 'botId' in resp:
-                print(f"  Bot ID: {resp['botId']}")
-            if 'queuePosition' in resp:
-                print(f"  Queue position: {resp['queuePosition']}")
-            if 'message' in resp:
-                print(f"  {resp['message']}")
-        print()
-        return 0
-    except Exception as e:
-        _print_failure(f"Upload failed: {e}")
-        return 1
 
 
 # ============================================================================
@@ -709,12 +645,6 @@ Examples:
     p_scaffold.add_argument("path", help="Path for the new bot file (e.g., my_bot.py)")
     p_scaffold.set_defaults(func=cmd_scaffold)
 
-    # Seed
-    p_seed = sub.add_parser("seed", help="Calculate the seed for two bots")
-    p_seed.add_argument("bot_a", help="First bot file")
-    p_seed.add_argument("bot_b", help="Second bot file")
-    p_seed.set_defaults(func=cmd_seed)
-
     # Check
     p_check = sub.add_parser("check", help="Verify your bot is deterministic")
     p_check.add_argument("bot", help="Your bot file")
@@ -744,16 +674,6 @@ Examples:
     p_qualify.set_defaults(invert_opponent=True)
     p_qualify.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
     p_qualify.set_defaults(func=cmd_qualify)
-
-    # Upload
-    p_upload = sub.add_parser("upload", help="Upload your bot to the server")
-    p_upload.add_argument("bot", help="Your bot file")
-    p_upload.add_argument("--name", required=True, help="Name for your bot")
-    p_upload.add_argument("--base-url", required=True, help="Server URL (e.g., https://nashium.com)")
-    p_upload.add_argument("--endpoint", default="/api/bots/submit", help="API endpoint")
-    p_upload.add_argument("--token", default=None, help="Your authentication token")
-    p_upload.add_argument("--timeout-seconds", type=float, default=30.0)
-    p_upload.set_defaults(func=cmd_upload)
 
     args = parser.parse_args(argv)
 
