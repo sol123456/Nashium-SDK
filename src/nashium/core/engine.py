@@ -3,8 +3,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from .errors import InvalidMoveError
+if TYPE_CHECKING:
+    from .executor import BotExecutor
 
 
 @dataclass(frozen=True)
@@ -51,61 +53,50 @@ class MatchTrace:
     leaderboard_moves_effective: tuple[int, ...]
 
 
-def _validate_move(move: int, round_index: int, bot_name: str = "Bot") -> int:
-    if move in (0, 1):
-        return move
-    raise InvalidMoveError(
-        f"{bot_name} returned invalid move {move!r} on round {round_index}. Expected 0 or 1."
+def _compute_result(submitted_wins: int, config: MatchConfig) -> tuple[InteractionResult, bool]:
+    """Compute match result and statistical significance."""
+    stat_sig = (
+        submitted_wins >= config.stat_sig_win_threshold
+        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
     )
 
+    if submitted_wins >= config.stat_sig_win_threshold:
+        result = InteractionResult.S_WIN
+    elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
+        result = InteractionResult.S_LOSS
+    elif submitted_wins == config.rounds // 2:
+        result = InteractionResult.DRAW
+    elif submitted_wins > config.rounds // 2:
+        result = InteractionResult.STAT_DRAW_S_WIN
+    else:
+        result = InteractionResult.STAT_DRAW_S_LOSS
 
-def _play_rounds(
-        submitted_bot,
-        leaderboard_bot,
-        config: MatchConfig,
-        *,
-        capture_histories: bool,
-):
+    return result, stat_sig
+
+
+def _play_rounds_with_executors(
+    submitted_executor: "BotExecutor",
+    leaderboard_executor: "BotExecutor",
+    config: MatchConfig,
+    *,
+    capture_histories: bool,
+) -> tuple:
+    """Core game loop using executor abstraction."""
     submitted_history: list[int] = []
     leaderboard_raw_history: list[int] = []
     leaderboard_effective_history: list[int] = []
-
     submitted_wins = 0
-    submitted_time = 0.0
-    leaderboard_time = 0.0
-
-    submitted_timed_out = False
-    leaderboard_timed_out = False
 
     for i in range(config.rounds):
         s_state = RoundState(i, tuple(submitted_history), tuple(leaderboard_effective_history))
         l_state = RoundState(i, tuple(leaderboard_raw_history), tuple(submitted_history))
 
-        # Submitted bot move
-        if submitted_timed_out:
-            s_move = 0
-        else:
-            s_start = time.perf_counter()
-            s_move = _validate_move(int(submitted_bot.move(s_state)), i, "Submitted bot")
-            submitted_time += time.perf_counter() - s_start
-            if submitted_time > config.max_total_time_seconds_per_bot:
-                submitted_timed_out = True
+        s_move = submitted_executor.get_move(s_state)
+        l_move_raw = leaderboard_executor.get_move(l_state)
 
-        # Leaderboard bot move
-        if leaderboard_timed_out:
-            l_move_raw = 0
-        else:
-            l_start = time.perf_counter()
-            l_move_raw = _validate_move(int(leaderboard_bot.move(l_state)), i, "Leaderboard bot")
-            leaderboard_time += time.perf_counter() - l_start
-            if leaderboard_time > config.max_total_time_seconds_per_bot:
-                leaderboard_timed_out = True
-
-        # Always invert opponent - this makes the game zero-sum
-        # The leaderboard bot doesn't know it's inverted; it just outputs 0 or 1
+        # Invert leaderboard move - makes game zero-sum
         l_move = 1 - l_move_raw
 
-        # Submitted bot wins if they match (predicted correctly)
         if s_move == l_move:
             submitted_wins += 1
 
@@ -119,62 +110,20 @@ def _play_rounds(
             tuple(submitted_history),
             tuple(leaderboard_raw_history),
             tuple(leaderboard_effective_history),
-            submitted_time,
-            leaderboard_time,
-            submitted_timed_out,
-            leaderboard_timed_out,
         )
-
-    return (
-        submitted_wins,
-        None,
-        None,
-        None,
-        submitted_time,
-        leaderboard_time,
-        submitted_timed_out,
-        leaderboard_timed_out,
-    )
+    return (submitted_wins, None, None, None)
 
 
-def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSummary:
-    start = time.perf_counter()
-
-    (
-        submitted_wins,
-        _s_hist,
-        _l_raw,
-        _l_eff,
-        submitted_time,
-        leaderboard_time,
-        submitted_timed_out,
-        leaderboard_timed_out,
-    ) = _play_rounds(
-        submitted_bot,
-        leaderboard_bot,
-        config,
-        capture_histories=False,
-    )
-
-    end = time.perf_counter()
-
+def _build_summary(
+    submitted_wins: int,
+    config: MatchConfig,
+    submitted_executor: "BotExecutor",
+    leaderboard_executor: "BotExecutor",
+    wall_time: float,
+) -> MatchSummary:
+    """Build a MatchSummary from match results."""
+    result, stat_sig = _compute_result(submitted_wins, config)
     win_rate = submitted_wins / config.rounds if config.rounds else 0.0
-    stat_sig = (
-            submitted_wins >= config.stat_sig_win_threshold
-            or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
-    )
-
-    if submitted_wins >= config.stat_sig_win_threshold:
-        result = InteractionResult.S_WIN
-    elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
-        result = InteractionResult.S_LOSS
-    else:
-        if submitted_wins == config.rounds // 2:
-            result = InteractionResult.DRAW
-        elif submitted_wins > config.rounds // 2:
-            result = InteractionResult.STAT_DRAW_S_WIN
-        else:
-            result = InteractionResult.STAT_DRAW_S_LOSS
 
     return MatchSummary(
         rounds=config.rounds,
@@ -182,64 +131,50 @@ def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSumma
         submitted_win_rate=win_rate,
         result=result,
         stat_sig=stat_sig,
-        submitted_time_seconds=submitted_time,
-        leaderboard_time_seconds=leaderboard_time,
-        wall_time_seconds=end - start,
-        submitted_timed_out=submitted_timed_out,
-        leaderboard_timed_out=leaderboard_timed_out,
+        submitted_time_seconds=submitted_executor.elapsed_time,
+        leaderboard_time_seconds=leaderboard_executor.elapsed_time,
+        wall_time_seconds=wall_time,
+        submitted_timed_out=submitted_executor.timed_out,
+        leaderboard_timed_out=leaderboard_executor.timed_out,
     )
 
 
-def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchTrace:
+def run_match_with_executors(
+    submitted_executor: "BotExecutor",
+    leaderboard_executor: "BotExecutor",
+    config: MatchConfig,
+) -> MatchSummary:
+    """Run a match using pre-configured executors.
+
+    Use this for sandboxed execution with DockerExecutor.
+    """
     start = time.perf_counter()
 
-    (
-        submitted_wins,
-        s_hist,
-        l_raw,
-        l_eff,
-        submitted_time,
-        leaderboard_time,
-        submitted_timed_out,
-        leaderboard_timed_out,
-    ) = _play_rounds(
-        submitted_bot,
-        leaderboard_bot,
-        config,
-        capture_histories=True,
+    submitted_wins, _, _, _ = _play_rounds_with_executors(
+        submitted_executor, leaderboard_executor, config, capture_histories=False
     )
 
-    end = time.perf_counter()
-
-    win_rate = submitted_wins / config.rounds if config.rounds else 0.0
-    stat_sig = (
-            submitted_wins >= config.stat_sig_win_threshold
-            or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
+    return _build_summary(
+        submitted_wins, config, submitted_executor, leaderboard_executor,
+        time.perf_counter() - start
     )
 
-    if submitted_wins >= config.stat_sig_win_threshold:
-        result = InteractionResult.S_WIN
-    elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
-        result = InteractionResult.S_LOSS
-    else:
-        if submitted_wins == config.rounds // 2:
-            result = InteractionResult.DRAW
-        elif submitted_wins > config.rounds // 2:
-            result = InteractionResult.STAT_DRAW_S_WIN
-        else:
-            result = InteractionResult.STAT_DRAW_S_LOSS
 
-    summary = MatchSummary(
-        rounds=config.rounds,
-        submitted_wins=submitted_wins,
-        submitted_win_rate=win_rate,
-        result=result,
-        stat_sig=stat_sig,
-        submitted_time_seconds=submitted_time,
-        leaderboard_time_seconds=leaderboard_time,
-        wall_time_seconds=end - start,
-        submitted_timed_out=submitted_timed_out,
-        leaderboard_timed_out=leaderboard_timed_out,
+def run_match_trace_with_executors(
+    submitted_executor: "BotExecutor",
+    leaderboard_executor: "BotExecutor",
+    config: MatchConfig,
+) -> MatchTrace:
+    """Run a match with full trace using pre-configured executors."""
+    start = time.perf_counter()
+
+    submitted_wins, s_hist, l_raw, l_eff = _play_rounds_with_executors(
+        submitted_executor, leaderboard_executor, config, capture_histories=True
+    )
+
+    summary = _build_summary(
+        submitted_wins, config, submitted_executor, leaderboard_executor,
+        time.perf_counter() - start
     )
 
     return MatchTrace(
@@ -248,3 +183,30 @@ def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> Matc
         leaderboard_moves_raw=l_raw or (),
         leaderboard_moves_effective=l_eff or (),
     )
+
+
+# Backward-compatible convenience functions
+def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSummary:
+    """Run a match between two bot objects.
+
+    Convenience function for local testing with trusted code.
+    For sandboxed execution, use run_match_with_executors().
+    """
+    from .executor import LocalExecutor
+
+    with LocalExecutor(submitted_bot, config.max_total_time_seconds_per_bot) as sub:
+        with LocalExecutor(leaderboard_bot, config.max_total_time_seconds_per_bot) as lb:
+            return run_match_with_executors(sub, lb, config)
+
+
+def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchTrace:
+    """Run a match with full trace between two bot objects.
+
+    Convenience function for local testing with trusted code.
+    For sandboxed execution, use run_match_trace_with_executors().
+    """
+    from .executor import LocalExecutor
+
+    with LocalExecutor(submitted_bot, config.max_total_time_seconds_per_bot) as sub:
+        with LocalExecutor(leaderboard_bot, config.max_total_time_seconds_per_bot) as lb:
+            return run_match_trace_with_executors(sub, lb, config)
