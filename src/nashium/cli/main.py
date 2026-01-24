@@ -36,6 +36,7 @@ Examples:
     p_check.add_argument("--rounds", type=int, default=2_000, help="Rounds per test (default: 2000)")
     p_check.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_check.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
+    p_check.add_argument("--sandbox",action="store_true",help="Run in sandboxed subprocess (slower but safer)")
     p_check.set_defaults(func=cmd_check)
 
     # Run
@@ -45,6 +46,7 @@ Examples:
     p_run.add_argument("--rounds", type=int, default=10_000, help="Rounds to play (default: 10000)")
     p_run.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_run.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
+    p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess (slower but safer)")
     p_run.set_defaults(func=cmd_run)
 
     # Qualify
@@ -53,6 +55,7 @@ Examples:
     p_qualify.add_argument("--rounds", type=int, default=10_000, help="Rounds per match (default: 10000)")
     p_qualify.add_argument("--seed", type=int, default=None, help="Use a specific seed (default: random)")
     p_qualify.add_argument("--time-budget", type=float, default=100.0, help="Time limit in seconds")
+    p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess (slower but safer)")
     p_qualify.set_defaults(func=cmd_qualify)
 
     args = parser.parse_args(argv)

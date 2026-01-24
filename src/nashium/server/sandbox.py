@@ -10,8 +10,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..core import RoundState, BotLoadError, InvalidMoveError
-from ..core.errors import BotRuntimeError
+from nashium.core import RoundState, BotLoadError, InvalidMoveError
+from nashium.core.errors import BotRuntimeError
 
 
 @dataclass
@@ -40,6 +40,7 @@ class SubprocessExecutor:
             bot_code: str,
             time_limit: float = 100.0,
             move_timeout: float = 5.0,
+            seed: int | None = None,
             python_executable: str | None = None,
     ):
         self._time_limit = time_limit
@@ -49,8 +50,8 @@ class SubprocessExecutor:
         self._closed = False
         self._python = python_executable or sys.executable
         self._process: subprocess.Popen | None = None
+        self._seed = seed
 
-        # Queue for receiving responses from reader thread
         self._response_queue: queue.Queue = queue.Queue()
         self._reader_thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
@@ -64,7 +65,6 @@ class SubprocessExecutor:
         if not runner_path.exists():
             raise FileNotFoundError(f"Runner script not found: {runner_path}")
 
-        # Create subprocess with new session on Unix for clean termination
         kwargs = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -73,7 +73,6 @@ class SubprocessExecutor:
             "bufsize": 1,
         }
 
-        # On Unix, create new process group for clean kills
         if hasattr(os, "setsid"):
             kwargs["start_new_session"] = True
 
@@ -82,11 +81,14 @@ class SubprocessExecutor:
             **kwargs
         )
 
-        # Start reader thread
         self._start_reader_thread()
 
-        # Load bot with timeout
-        self._send({"cmd": "load", "code": bot_code})
+        # Load bot with optional seed
+        load_cmd = {"cmd": "load", "code": bot_code}
+        if self._seed is not None:
+            load_cmd["seed"] = self._seed
+
+        self._send(load_cmd)
         response = self._recv(timeout=10.0)
 
         if response.get("status") != "ok":
@@ -105,7 +107,6 @@ class SubprocessExecutor:
                 try:
                     line = self._process.stdout.readline()
                     if not line:
-                        # EOF - process terminated
                         self._response_queue.put(("eof", None))
                         break
                     self._response_queue.put(("ok", line))
@@ -136,7 +137,6 @@ class SubprocessExecutor:
         try:
             status, data = self._response_queue.get(timeout=timeout)
         except queue.Empty:
-            # Timeout - kill the process
             self._kill_process()
             self._timed_out = True
             raise BotRuntimeError(
@@ -156,7 +156,6 @@ class SubprocessExecutor:
             self._kill_process()
             raise BotRuntimeError(f"Read error: {data}", RuntimeError())
 
-        # status == "ok", data is the line
         try:
             return json.loads(data)
         except json.JSONDecodeError as e:
@@ -167,7 +166,6 @@ class SubprocessExecutor:
         if self._process is None or self._process.stderr is None:
             return ""
         try:
-            # Set non-blocking and read what's available
             import select
             if hasattr(select, "select"):
                 ready, _, _ = select.select([self._process.stderr], [], [], 0.1)
@@ -183,41 +181,34 @@ class SubprocessExecutor:
             return
 
         self._stop_reader.set()
-
         pid = self._process.pid
 
-        # Try terminate first
         try:
             self._process.terminate()
         except:
             pass
 
-        # Give it a moment
         try:
             self._process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             pass
 
-        # Force kill
         try:
             self._process.kill()
         except:
             pass
 
-        # On Unix, kill the entire process group
         if hasattr(os, "killpg"):
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
 
-        # Wait for process to actually die
         try:
             self._process.wait(timeout=1)
         except:
             pass
 
-        # Close file handles
         for stream in [self._process.stdin, self._process.stdout, self._process.stderr]:
             if stream:
                 try:
@@ -226,27 +217,17 @@ class SubprocessExecutor:
                     pass
 
     def get_move(self, opponent_last_move: int | None) -> int:
-        """
-        Get the bot's next move.
-
-        Args:
-            opponent_last_move: The opponent's last move (None for first round)
-
-        Returns:
-            The bot's move (0 or 1), or 0 if timed out
-        """
+        """Get the bot's next move."""
         if self._timed_out:
             return 0
 
         if self._closed:
             return 0
 
-        # Check if we've exceeded total time limit
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
             return 0
 
-        # Send move request
         msg = {"cmd": "move"}
         if opponent_last_move is not None:
             msg["opponent_last"] = opponent_last_move
@@ -308,7 +289,6 @@ class SubprocessExecutor:
         if self._process is None:
             return
 
-        # Try graceful shutdown
         try:
             if self._process.stdin and not self._process.stdin.closed:
                 self._process.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
@@ -317,7 +297,6 @@ class SubprocessExecutor:
         except:
             pass
 
-        # Force kill
         self._kill_process()
 
     def __enter__(self) -> "SubprocessExecutor":

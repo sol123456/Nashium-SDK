@@ -41,23 +41,19 @@ class BotRunner:
         Process opponent's last move and generate our move.
         Returns (move, time_taken).
         """
-        # Record opponent's last move (if not first round)
         if opponent_last_move is not None:
             self.opponent_history.append(opponent_last_move)
 
-        # Build state
         state = RoundState(
             round_index=self.round_index,
             my_history=tuple(self.my_history),
             opponent_history=tuple(self.opponent_history),
         )
 
-        # Get move with timing
         start = time.perf_counter()
         move = int(self.bot.move(state))
         elapsed = time.perf_counter() - start
 
-        # Record our move
         self.my_history.append(move)
         self.round_index += 1
 
@@ -81,8 +77,13 @@ def recv() -> dict | None:
         return None
 
 
-def load_bot(code: str):
-    """Load and instantiate a bot from source code."""
+def load_bot(code: str, seed: int | None = None):
+    """
+    Load and instantiate a bot from source code.
+
+    If seed is provided and the Bot class accepts a seed parameter,
+    it will be passed to the constructor.
+    """
     namespace = {"__name__": "__bot__"}
     namespace["RoundState"] = RoundState
 
@@ -105,6 +106,16 @@ def load_bot(code: str):
             "No Bot class found. Define a class named 'Bot' with a 'move' method."
         )
 
+    # Try to instantiate with seed, fall back to no args
+    if seed is not None:
+        try:
+            return bot_class(seed=seed)
+        except TypeError:
+            try:
+                return bot_class(seed)
+            except TypeError:
+                pass
+
     return bot_class()
 
 
@@ -123,7 +134,8 @@ def main():
 
         elif command == "load":
             try:
-                bot = load_bot(cmd["code"])
+                seed = cmd.get("seed")  # Optional seed
+                bot = load_bot(cmd["code"], seed=seed)
                 runner = BotRunner(bot)
                 send({"status": "ok"})
             except Exception as e:
@@ -145,8 +157,7 @@ def main():
                 continue
 
             try:
-                # Only receive opponent's last move, not full history
-                opponent_last = cmd.get("opponent_last")  # None for first round
+                opponent_last = cmd.get("opponent_last")
                 move, elapsed = runner.make_move(opponent_last)
                 send({"status": "ok", "move": move, "time": elapsed})
             except Exception as e:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import random
 from typing import Callable
 
@@ -97,4 +98,46 @@ def determinism_test_bot_factories() -> list[tuple[str, BotFactory]]:
         ("always_heads", lambda seed: AlwaysHeads()),
         ("alternator", lambda seed: Alternator()),
         ("random", lambda seed: RandomBot(seed)),  # Most important for determinism!
+    ]
+
+
+###################################################################################################################
+# SOURCE CODE EXTRACTION - For sandboxed execution
+###################################################################################################################
+
+def _get_bot_source(bot_class: type) -> str:
+    """
+    Extract source code for a bot class.
+
+    Includes necessary imports so the code can run standalone.
+    """
+    source = inspect.getsource(bot_class)
+    return f"import random\n\n{source}\n"
+
+
+def sample_leaderboard_bot_sources() -> list[tuple[str, str]]:
+    """
+    Returns (name, source_code) for sample leaderboard bots.
+
+    Used by SandboxBackend where we need source code rather than instances.
+    """
+    return [
+        ("always_heads", _get_bot_source(AlwaysHeads)),
+        ("always_tails", _get_bot_source(AlwaysTails)),
+        ("alternator", _get_bot_source(Alternator)),
+        ("mirror", _get_bot_source(MirrorOpponent)),
+        ("frequency_counter", _get_bot_source(FrequencyCounter)),
+    ]
+
+
+def determinism_test_bot_sources() -> list[tuple[str, str]]:
+    """
+    Returns (name, source_code) for determinism testing bots.
+
+    Used by SandboxBackend where we need source code rather than instances.
+    """
+    return [
+        ("always_heads", _get_bot_source(AlwaysHeads)),
+        ("alternator", _get_bot_source(Alternator)),
+        ("random", _get_bot_source(RandomBot)),
     ]
