@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-from .errors import BotLoadError
+from nashium.core.errors import BotLoadError
 
 
 def load_bot_from_file(path: str | Path, seed: int):

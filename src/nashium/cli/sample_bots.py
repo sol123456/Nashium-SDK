@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from .engine import RoundState
+from nashium.core.engine import RoundState
 
 # PLEASE NOTE: If you change these bots, the qualification code may not correctly test your bot.
 class AlwaysHeads:

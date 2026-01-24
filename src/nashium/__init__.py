@@ -10,8 +10,8 @@ __all__ = [
     "run_match_trace",
 ]
 
-from .bot_api import NashiumBot
-from .engine import (
+from nashium.core.bot_api import NashiumBot
+from nashium.core.engine import (
     InteractionResult,
     MatchConfig,
     MatchSummary,
@@ -20,6 +20,6 @@ from .engine import (
     run_match,
     run_match_trace,
 )
-from .loading import load_bot_from_file
+from nashium.cli.loading import load_bot_from_file
 
 __version__ = "0.1.0"
