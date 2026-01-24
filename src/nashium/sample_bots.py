@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .engine import RoundState
 
-
+# PLEASE DON'T CHANGE THESE BOTS. OTHERWISE, YOU MAY PASS THE QUALIFICATION BUT STILL BE REJECTED BY THE SERVER
 class AlwaysHeads:
     def move(self, state: RoundState) -> int:
         return 0
@@ -40,4 +40,5 @@ def sample_leaderboard_bots(seed: int) -> list[tuple[str, object]]:
         ("always_tails", AlwaysTails()),
         ("alternator", Alternator()),
         ("mirror", MirrorOpponent()),
+        ("frequency_counter", FrequencyCounter()),
     ]
