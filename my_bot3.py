@@ -90,7 +90,7 @@ class MyBot:
         #   - Look for alternating patterns
         #   - Detect if opponent is mirroring you
         #   - Use more sophisticated pattern matching
-        # time.sleep(1000)
+        time.sleep(1000)
         return self.rng.choice([0, 1]) #last_opponent_move
 
 
