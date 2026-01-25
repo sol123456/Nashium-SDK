@@ -4,12 +4,8 @@ import json
 import queue
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
-
-if TYPE_CHECKING:
-    from nashium.core.engine import RoundState
 
 try:
     import docker
@@ -35,16 +31,17 @@ class DockerExecutor:
     """
     Executes a bot in an isolated Docker container.
 
-    Implements the BotExecutor protocol for use with engine.run_match_with_executors().
-    Uses the same _subprocess_runner.py as SubprocessExecutor.
+    Same interface as SubprocessExecutor - uses delta protocol
+    (opponent_last_move) for efficient communication.
     """
 
     def __init__(
             self,
             bot_code: str,
             time_limit: float = 100.0,
-            config: DockerConfig | None = None,
+            move_timeout: float = 5.0,
             seed: int | None = None,
+            config: DockerConfig | None = None,
     ):
         if not DOCKER_AVAILABLE:
             raise RuntimeError(
@@ -52,7 +49,16 @@ class DockerExecutor:
                 "Install with: pip install docker"
             )
 
-        self.config = config or DockerConfig()
+        self._config = config or DockerConfig()
+        self._config = DockerConfig(
+            image=self._config.image,
+            memory_limit=self._config.memory_limit,
+            cpu_quota=self._config.cpu_quota,
+            cpu_period=self._config.cpu_period,
+            pids_limit=self._config.pids_limit,
+            move_timeout=move_timeout,
+        )
+
         self._bot_code = bot_code
         self._seed = seed
         self._time_limit = time_limit
@@ -74,13 +80,13 @@ class DockerExecutor:
         """Start Docker container and load bot."""
         try:
             self._container = self._client.containers.run(
-                image=self.config.image,
+                image=self._config.image,
                 detach=True,
                 stdin_open=True,
-                mem_limit=self.config.memory_limit,
-                cpu_quota=self.config.cpu_quota,
-                cpu_period=self.config.cpu_period,
-                pids_limit=self.config.pids_limit,
+                mem_limit=self._config.memory_limit,
+                cpu_quota=self._config.cpu_quota,
+                cpu_period=self._config.cpu_period,
+                pids_limit=self._config.pids_limit,
                 network_disabled=True,
                 read_only=True,
                 security_opt=["no-new-privileges:true"],
@@ -89,9 +95,11 @@ class DockerExecutor:
             )
         except docker.errors.ImageNotFound:
             raise RuntimeError(
-                f"Docker image '{self.config.image}' not found. "
-                f"Build with: docker build -t {self.config.image} nashium/server/"
+                f"Docker image '{self._config.image}' not found.\n"
+                f"Build with: docker build -t {self._config.image} src/nashium/server/"
             )
+        except docker.errors.APIError as e:
+            raise RuntimeError(f"Docker API error: {e}")
         except Exception as e:
             raise RuntimeError(f"Failed to start container: {e}")
 
@@ -100,7 +108,6 @@ class DockerExecutor:
             params={"stdout": 1, "stderr": 1, "stdin": 1, "stream": 1}
         )
 
-        # Start reader thread
         self._start_reader_thread()
 
         # Load bot code
@@ -130,16 +137,14 @@ class DockerExecutor:
 
                     buffer += chunk
 
-                    # Process complete lines
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
 
                         # Docker multiplexed stream has 8-byte header
-                        # Format: [stream_type, 0, 0, 0, size (4 bytes)]
                         if len(line) >= 8 and line[0:1] in (b"\x01", b"\x02"):
                             line = line[8:]
 
-                        decoded = line.decode('utf-8').strip()
+                        decoded = line.decode("utf-8").strip()
                         if decoded:
                             self._response_queue.put(("ok", decoded))
 
@@ -160,11 +165,11 @@ class DockerExecutor:
             self._socket._sock.send(line.encode())
         except Exception as e:
             self._kill_container()
-            raise BotRuntimeError("Failed to send command to container", e)
+            raise BotRuntimeError("Failed to send to container", e)
 
     def _recv(self, timeout: float | None = None) -> dict:
         """Receive JSON response from container."""
-        timeout = timeout if timeout is not None else self.config.move_timeout
+        timeout = timeout if timeout is not None else self._config.move_timeout
 
         try:
             status, data = self._response_queue.get(timeout=timeout)
@@ -172,17 +177,14 @@ class DockerExecutor:
             self._kill_container()
             self._timed_out = True
             raise BotRuntimeError(
-                f"Move timed out after {timeout}s",
+                f"Move timed out after {timeout}s - container killed",
                 TimeoutError()
             )
 
         if status == "eof":
             logs = self._get_logs()
             self._kill_container()
-            raise BotRuntimeError(
-                f"Container terminated. Logs: {logs}",
-                RuntimeError()
-            )
+            raise BotRuntimeError(f"Container terminated. Logs: {logs}", RuntimeError())
 
         if status == "error":
             self._kill_container()
@@ -194,7 +196,7 @@ class DockerExecutor:
             raise BotRuntimeError(f"Invalid JSON: {data!r}", e)
 
     def _get_logs(self) -> str:
-        """Get container logs."""
+        """Get container logs for debugging."""
         if self._container is None:
             return ""
         try:
@@ -224,14 +226,11 @@ class DockerExecutor:
         except:
             pass
 
-    # BotExecutor protocol implementation
-
-    def get_move(self, state: "RoundState") -> int:
+    def get_move(self, opponent_last_move: int | None) -> int:
         """
-        Get bot's next move for the given state.
+        Get bot's next move.
 
-        Implements BotExecutor protocol. Extracts delta (opponent's last move)
-        from state for efficient communication with container.
+        Same interface as SubprocessExecutor.
         """
         if self._timed_out or self._closed:
             return 0
@@ -240,14 +239,9 @@ class DockerExecutor:
             self._timed_out = True
             return 0
 
-        # Extract just the opponent's last move (delta)
-        opponent_last = None
-        if state.opponent_history:
-            opponent_last = state.opponent_history[-1]
-
         msg = {"cmd": "move"}
-        if opponent_last is not None:
-            msg["opponent_last"] = opponent_last
+        if opponent_last_move is not None:
+            msg["opponent_last"] = opponent_last_move
 
         try:
             self._send(msg)
@@ -257,10 +251,7 @@ class DockerExecutor:
             return 0
 
         if response.get("status") == "error":
-            raise BotRuntimeError(
-                response.get("error", "Unknown error"),
-                RuntimeError()
-            )
+            raise BotRuntimeError(response.get("error", "Unknown error"), RuntimeError())
 
         move = response.get("move", 0)
         elapsed = response.get("time", 0.0)
@@ -276,16 +267,14 @@ class DockerExecutor:
 
     @property
     def elapsed_time(self) -> float:
-        """Total time spent by bot computing moves."""
         return self._elapsed_time
 
     @property
     def timed_out(self) -> bool:
-        """Whether the bot has exceeded its time limit."""
         return self._timed_out
 
     def close(self) -> None:
-        """Clean up container resources."""
+        """Clean up container."""
         if self._closed:
             return
 

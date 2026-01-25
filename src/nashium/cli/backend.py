@@ -3,6 +3,7 @@ Backend abstraction for bot execution.
 
 LocalBackend: Fast in-process execution (current behavior)
 SandboxBackend: Safe subprocess execution for untrusted code
+DockerBackend: Full container isolation (matches server environment)
 """
 from __future__ import annotations
 
@@ -24,6 +25,12 @@ from ..core import (
 class Backend(ABC):
     """Abstract backend for bot execution."""
 
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable backend name."""
+        ...
+
     @abstractmethod
     def run_match_file_vs_source(
             self,
@@ -32,7 +39,6 @@ class Backend(ABC):
             seed: int,
             config: MatchConfig,
     ) -> MatchSummary:
-        """Run match: user file vs opponent source code."""
         ...
 
     @abstractmethod
@@ -43,7 +49,6 @@ class Backend(ABC):
             seed: int,
             config: MatchConfig,
     ) -> MatchTrace:
-        """Run match with trace: user file vs opponent source code."""
         ...
 
     @abstractmethod
@@ -54,7 +59,6 @@ class Backend(ABC):
             seed: int,
             config: MatchConfig,
     ) -> MatchSummary:
-        """Run match between two bot files."""
         ...
 
     @abstractmethod
@@ -65,7 +69,6 @@ class Backend(ABC):
             seed: int,
             config: MatchConfig,
     ) -> MatchTrace:
-        """Run match with trace between two bot files."""
         ...
 
 
@@ -73,14 +76,12 @@ def _load_bot_from_source(source: str, seed: int):
     """Load a bot instance from source code string."""
     namespace = {
         "__name__": "__bot__",
-        "RoundState": RoundState,  # ← Add this import!
+        "RoundState": RoundState,
     }
     exec(compile(source, "<bot>", "exec"), namespace)
 
-    # Look for Bot class first (user bots)
     bot_class = namespace.get("Bot")
 
-    # If not found, look for any class with a move method (sample bots)
     if bot_class is None:
         for name, obj in namespace.items():
             if (
@@ -94,22 +95,21 @@ def _load_bot_from_source(source: str, seed: int):
     if bot_class is None:
         raise ValueError("No bot class found in source code")
 
-    # Try instantiation with seed (now that sample bots accept it!)
     try:
-        return bot_class(seed=seed)  # ← Try keyword first (most explicit)
+        return bot_class(seed=seed)
     except TypeError:
         try:
-            return bot_class(seed)  # ← Then positional
+            return bot_class(seed)
         except TypeError:
-            return bot_class()  # ← Finally no args (shouldn't happen now)
+            return bot_class()
 
 
 class LocalBackend(Backend):
-    """
-    Fast in-process execution for trusted code.
+    """Fast in-process execution for trusted code."""
 
-    This is the default - runs bots directly in the current process.
-    """
+    @property
+    def name(self) -> str:
+        return "local"
 
     def run_match_file_vs_source(
             self,
@@ -164,26 +164,20 @@ class LocalBackend(Backend):
         return run_match_trace(bot_a, bot_b, config)
 
 
-class SandboxBackend(Backend):
+class _IsolatedBackend(Backend):
     """
-    Safe subprocess execution for untrusted code.
+    Base class for backends that run bots in isolated processes.
 
-    Runs each bot in a separate subprocess with timeouts.
-    Slower than LocalBackend but provides isolation.
+    Shared game loop for SandboxBackend and DockerBackend.
     """
 
     def __init__(self, move_timeout: float = 5.0):
         self._move_timeout = move_timeout
 
+    @abstractmethod
     def _create_executor(self, source: str, seed: int, config: MatchConfig):
-        from ..server.sandbox import SubprocessExecutor
-
-        return SubprocessExecutor(
-            source,
-            time_limit=config.max_total_time_seconds_per_bot,
-            move_timeout=self._move_timeout,
-            seed=seed,
-        )
+        """Create an executor for the given source code."""
+        ...
 
     def _run_match_internal(
             self,
@@ -313,8 +307,91 @@ class SandboxBackend(Backend):
         )
 
 
-def get_backend(sandbox: bool = False, move_timeout: float = 5.0) -> Backend:
-    """Get the appropriate backend."""
-    if sandbox:
+class SandboxBackend(_IsolatedBackend):
+    """Subprocess isolation (fast, partial isolation)."""
+
+    @property
+    def name(self) -> str:
+        return "subprocess sandbox"
+
+    def _create_executor(self, source: str, seed: int, config: MatchConfig):
+        from ..server.sandbox import SubprocessExecutor
+
+        return SubprocessExecutor(
+            source,
+            time_limit=config.max_total_time_seconds_per_bot,
+            move_timeout=self._move_timeout,
+            seed=seed,
+        )
+
+
+class DockerBackend(_IsolatedBackend):
+    """Docker container isolation (slow, full isolation)."""
+
+    def __init__(self, move_timeout: float = 5.0):
+        super().__init__(move_timeout)
+        self._validate_docker()
+
+    def _validate_docker(self) -> None:
+        """Validate Docker is available and properly configured."""
+        from ..server.docker import DOCKER_AVAILABLE, DockerConfig
+
+        if not DOCKER_AVAILABLE:
+            raise RuntimeError(
+                "Docker backend requires 'docker' package.\n"
+                "Install with: pip install docker"
+            )
+
+        import docker
+
+        try:
+            client = docker.from_env()
+            client.ping()
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot connect to Docker daemon. Is Docker running?\n"
+                f"Error: {e}"
+            )
+
+        config = DockerConfig()
+        try:
+            client.images.get(config.image)
+        except docker.errors.ImageNotFound:
+            raise RuntimeError(
+                f"Docker image '{config.image}' not found.\n"
+                f"Build with: docker build -t {config.image} src/nashium/server/"
+            )
+
+    @property
+    def name(self) -> str:
+        return "docker container"
+
+    def _create_executor(self, source: str, seed: int, config: MatchConfig):
+        from ..server.docker import DockerExecutor
+
+        return DockerExecutor(
+            source,
+            time_limit=config.max_total_time_seconds_per_bot,
+            move_timeout=self._move_timeout,
+            seed=seed,
+        )
+
+
+def get_backend(
+    sandbox: bool = False,
+    docker: bool = False,
+    move_timeout: float = 5.0,
+) -> Backend:
+    """
+    Get the appropriate backend.
+
+    Args:
+        sandbox: Use subprocess isolation
+        docker: Use Docker container isolation (overrides sandbox)
+        move_timeout: Timeout per move in seconds
+    """
+    if docker:
+        return DockerBackend(move_timeout=move_timeout)
+    elif sandbox:
         return SandboxBackend(move_timeout=move_timeout)
     return LocalBackend()

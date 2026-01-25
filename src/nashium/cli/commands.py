@@ -318,10 +318,7 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         print_info(f"Saving match logs to: {output_base_dir}/")
 
     # =========== STEP 1: Determinism Check ===========
-    determinism_config = MatchConfig(
-        rounds=2000,
-        max_total_time_seconds_per_bot=args.time_budget,
-    )
+    determinism_config = config
 
     # Don't save determinism check output
     is_deterministic, failed_det_opponents = run_determinism_check(
