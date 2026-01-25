@@ -57,6 +57,17 @@ class Backend(ABC):
         """Run match between two bot files."""
         ...
 
+    @abstractmethod
+    def run_match_trace_between_files(
+            self,
+            path_a: Path,
+            path_b: Path,
+            seed: int,
+            config: MatchConfig,
+    ) -> MatchTrace:
+        """Run match with trace between two bot files."""
+        ...
+
 
 def _load_bot_from_source(source: str, seed: int):
     """Load a bot instance from source code string."""
@@ -138,6 +149,19 @@ class LocalBackend(Backend):
         bot_a = load_bot_from_file(path_a, seed)
         bot_b = load_bot_from_file(path_b, seed)
         return run_match(bot_a, bot_b, config)
+
+    def run_match_trace_between_files(
+            self,
+            path_a: Path,
+            path_b: Path,
+            seed: int,
+            config: MatchConfig,
+    ) -> MatchTrace:
+        from .loader import load_bot_from_file
+
+        bot_a = load_bot_from_file(path_a, seed)
+        bot_b = load_bot_from_file(path_b, seed)
+        return run_match_trace(bot_a, bot_b, config)
 
 
 class SandboxBackend(Backend):
@@ -273,6 +297,19 @@ class SandboxBackend(Backend):
         source_b = path_b.read_text()
         return self._run_match_internal(
             source_a, source_b, seed, config, capture_history=False
+        )
+
+    def run_match_trace_between_files(
+            self,
+            path_a: Path,
+            path_b: Path,
+            seed: int,
+            config: MatchConfig,
+    ) -> MatchTrace:
+        source_a = path_a.read_text()
+        source_b = path_b.read_text()
+        return self._run_match_internal(
+            source_a, source_b, seed, config, capture_history=True
         )
 
 

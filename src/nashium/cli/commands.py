@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 from pathlib import Path
 
 from .backend import get_backend
@@ -18,12 +19,56 @@ from .formatting import (
 )
 from .loader import load_bot_from_file
 from .sample_bots import determinism_test_bot_sources, sample_leaderboard_bot_sources
-from ..core import InteractionResult, MatchConfig, run_match
+from ..core import InteractionResult, MatchConfig, run_match, run_match_trace
 
 
 def _generate_random_seed() -> int:
     """Generate a random seed for match execution."""
     return random.randint(0, (1 << 63) - 1)
+
+
+def _safe_filename_component(value: str) -> str:
+    cleaned = re.sub(r"[<>:\"/\\|?*]", "_", value)
+    cleaned = cleaned.strip().rstrip(".")
+    return cleaned or "match"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+
+    i = 2
+    while True:
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _write_match_logs(
+    *,
+    out_dir: Path,
+    match_label: str,
+    seed: int,
+    trace,
+    captured_output: str,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base = _safe_filename_component(f"{match_label} (seed {seed})")
+    output_path = _unique_path(out_dir / f"{base} (output).log")
+    score_path = _unique_path(out_dir / f"{base} (score).txt")
+
+    output_path.write_text(captured_output, encoding="utf-8")
+    scores = [
+        "1" if s == o else "0"
+        for s, o in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
+    ]
+    score_path.write_text("\n".join(scores) + ("\n" if scores else ""), encoding="utf-8")
 
 
 # ============================================================================
@@ -162,6 +207,8 @@ def run_determinism_check(
         config: MatchConfig,
         sandbox: bool = False,
         verbose: bool = True,
+        save_output: bool = False,
+        save_output_dir: Path | None = None,
 ) -> tuple[bool, list[str]]:
     """
     Run determinism check against test bots.
@@ -180,6 +227,29 @@ def run_determinism_check(
     for name, opponent_source in opponent_sources:
         trace_1 = backend.run_match_trace_file_vs_source(bot_path, opponent_source, seed, config)
         trace_2 = backend.run_match_trace_file_vs_source(bot_path, opponent_source, seed, config)
+
+        if save_output and save_output_dir is not None:
+            out_1 = "\n".join(str(x) for x in trace_1.submitted_moves)
+            if out_1:
+                out_1 += "\n"
+            _write_match_logs(
+                out_dir=save_output_dir,
+                match_label=f"{bot_path.name} vs {name} (determinism run 1)",
+                seed=seed,
+                trace=trace_1,
+                captured_output=out_1,
+            )
+
+            out_2 = "\n".join(str(x) for x in trace_2.submitted_moves)
+            if out_2:
+                out_2 += "\n"
+            _write_match_logs(
+                out_dir=save_output_dir,
+                match_label=f"{bot_path.name} vs {name} (determinism run 2)",
+                seed=seed,
+                trace=trace_2,
+                captured_output=out_2,
+            )
 
         same = trace_1.submitted_moves == trace_2.submitted_moves
 
@@ -241,8 +311,17 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
+    save_output = bool(getattr(args, "save_output", False))
+    save_output_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs"))
+
     is_deterministic, failed_det_opponents = run_determinism_check(
-        submitted_path, seed, determinism_config, sandbox=sandbox, verbose=False
+        submitted_path,
+        seed,
+        determinism_config,
+        sandbox=sandbox,
+        verbose=False,
+        save_output=save_output,
+        save_output_dir=save_output_dir,
     )
 
     if is_deterministic:
@@ -260,7 +339,23 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     any_timed_out = False
 
     for name, opponent_source in opponents:
-        summary = backend.run_match_file_vs_source(submitted_path, opponent_source, seed, config)
+        if save_output:
+            trace = backend.run_match_trace_file_vs_source(submitted_path, opponent_source, seed, config)
+            summary = trace.summary
+
+            submitted_outputs = "\n".join(str(x) for x in trace.submitted_moves)
+            if submitted_outputs:
+                submitted_outputs += "\n"
+
+            _write_match_logs(
+                out_dir=save_output_dir,
+                match_label=f"{submitted_path.name} vs {name}",
+                seed=seed,
+                trace=trace,
+                captured_output=submitted_outputs,
+            )
+        else:
+            summary = backend.run_match_file_vs_source(submitted_path, opponent_source, seed, config)
 
         max_time_used = max(max_time_used, summary.submitted_time_seconds)
         passed = summary.result == InteractionResult.S_WIN and summary.stat_sig
@@ -361,9 +456,9 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             print("    (at least 5,155 out of 10,000 rounds)")
             print()
             print("  Tips:")
-            print("    • 'always_heads' always plays 0, 'always_tails' always plays 1")
-            print("    • 'mirror' copies your last move")
-            print("    • 'alternator' switches between 0 and 1 each round")
+            print("    'always_heads' always plays 0, 'always_tails' always plays 1")
+            print("    'mirror' copies your last move")
+            print("    'alternator' switches between 0 and 1 each round")
             print()
 
         print(f"  {Colors.YELLOW}⚠ DISCLAIMER:{Colors.RESET}")
@@ -416,21 +511,21 @@ def cmd_check(args: argparse.Namespace) -> int:
     print()
 
     if is_deterministic:
-        print_header("✓ DETERMINISTIC")
+        print_header("")
         print_success("Your bot produces identical moves when given the same seed.")
         print()
         print("  This is required for fair competition. Your bot is ready!")
         print()
         return 0
     else:
-        print_header("✗ NOT DETERMINISTIC")
+        print_header("")
         print_failure("Your bot produces DIFFERENT moves when run twice with the same seed!")
         print()
         print("  This is not allowed. Common causes:")
         print(
-            f"    • Using {Colors.YELLOW}random.random(){Colors.RESET} instead of {Colors.GREEN}self.rng.random(){Colors.RESET}")
-        print(f"    • Using {Colors.YELLOW}time.time(){Colors.RESET} or other external state")
-        print(f"    • Using {Colors.YELLOW}dict{Colors.RESET} iteration (order can vary in older Python)")
+            f"    Using {Colors.YELLOW}random.random(){Colors.RESET} instead of {Colors.GREEN}self.rng.random(){Colors.RESET}")
+        print(f"    Using {Colors.YELLOW}time.time(){Colors.RESET} or other external state")
+        print(f"    Using {Colors.YELLOW}dict{Colors.RESET} iteration (order can vary in older Python)")
         print()
         print("  Fix: Use the seed provided in __init__ for ALL randomness:")
         print(f"    {Colors.CYAN}self.rng = random.Random(seed){Colors.RESET}")
@@ -479,13 +574,37 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
-    # Use backend for sandbox, direct for local (faster)
-    if sandbox:
-        summary = backend.run_match_between_files(a_path, b_path, seed, config)
+    save_output = bool(getattr(args, "save_output", False))
+    save_output_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs"))
+
+    trace = None
+    if save_output:
+        if sandbox:
+            trace = backend.run_match_trace_between_files(a_path, b_path, seed, config)
+        else:
+            bot_a = load_bot_from_file(a_path, seed)
+            bot_b = load_bot_from_file(b_path, seed)
+            trace = run_match_trace(bot_a, bot_b, config)
+
+        summary = trace.summary
+        submitted_outputs = "\n".join(str(x) for x in trace.submitted_moves)
+        if submitted_outputs:
+            submitted_outputs += "\n"
+
+        _write_match_logs(
+            out_dir=save_output_dir,
+            match_label=f"{a_path.name} vs {b_path.name}",
+            seed=seed,
+            trace=trace,
+            captured_output=submitted_outputs,
+        )
     else:
-        bot_a = load_bot_from_file(a_path, seed)
-        bot_b = load_bot_from_file(b_path, seed)
-        summary = run_match(bot_a, bot_b, config)
+        if sandbox:
+            summary = backend.run_match_between_files(a_path, b_path, seed, config)
+        else:
+            bot_a = load_bot_from_file(a_path, seed)
+            bot_b = load_bot_from_file(b_path, seed)
+            summary = run_match(bot_a, bot_b, config)
 
     status, explanation = format_result(
         summary.result, summary.stat_sig, summary.submitted_wins, summary.rounds

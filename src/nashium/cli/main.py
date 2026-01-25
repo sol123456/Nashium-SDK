@@ -48,6 +48,16 @@ Examples:
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--time-budget", type=float, default=100.0)
     p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
+    p_run.add_argument(
+        "--save-output",
+        action="store_true",
+        help="Save per-match submitted outputs and score (1/0) logs",
+    )
+    p_run.add_argument(
+        "--save-output-dir",
+        default="nashium_match_logs",
+        help="Directory to write saved match logs",
+    )
     p_run.set_defaults(func=cmd_run)
 
     # Qualify
@@ -57,6 +67,16 @@ Examples:
     p_qualify.add_argument("--seed", type=int, default=None)
     p_qualify.add_argument("--time-budget", type=float, default=100.0)
     p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
+    p_qualify.add_argument(
+        "--save-output",
+        action="store_true",
+        help="Save per-match submitted outputs and score (1/0) logs",
+    )
+    p_qualify.add_argument(
+        "--save-output-dir",
+        default="nashium_match_logs",
+        help="Directory to write saved match logs",
+    )
     p_qualify.set_defaults(func=cmd_qualify)
 
     args = parser.parse_args(argv)
