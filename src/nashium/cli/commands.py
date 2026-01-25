@@ -50,12 +50,12 @@ def _unique_path(path: Path) -> Path:
 
 
 def _write_match_logs(
-    *,
-    out_dir: Path,
-    match_label: str,
-    seed: int,
-    trace,
-    captured_output: str,
+        *,
+        out_dir: Path,
+        match_label: str,
+        seed: int,
+        trace,
+        captured_output: str,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -69,6 +69,24 @@ def _write_match_logs(
         for s, o in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
     ]
     score_path.write_text("\n".join(scores) + ("\n" if scores else ""), encoding="utf-8")
+
+
+def _get_execution_mode(sandbox: bool, docker: bool) -> str:
+    """Get human-readable execution mode string."""
+    if docker:
+        return "docker"
+    elif sandbox:
+        return "sandbox"
+    return "local"
+
+
+def _get_execution_flags(sandbox: bool, docker: bool) -> str:
+    """Get CLI flags string for reproducing the run."""
+    if docker:
+        return " --docker"
+    elif sandbox:
+        return " --sandbox"
+    return ""
 
 
 # ============================================================================
@@ -206,6 +224,7 @@ def run_determinism_check(
         seed: int,
         config: MatchConfig,
         sandbox: bool = False,
+        docker: bool = False,
         verbose: bool = True,
         save_output: bool = False,
         save_output_dir: Path | None = None,
@@ -215,8 +234,11 @@ def run_determinism_check(
 
     Returns:
         (is_deterministic, list of failed opponent names)
+
+    Raises:
+        RuntimeError: If Docker backend requested but unavailable.
     """
-    backend = get_backend(sandbox=sandbox)
+    backend = get_backend(sandbox=sandbox, docker=docker)
     opponent_sources = determinism_test_bot_sources()
     failed_opponents = []
 
@@ -281,11 +303,23 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         return 1
 
     sandbox = getattr(args, 'sandbox', False)
-    backend = get_backend(sandbox=sandbox)
-    mode_str = "sandbox" if sandbox else "local"
+    docker = getattr(args, 'docker', False)
+    mode_str = _get_execution_mode(sandbox, docker)
+    mode_flags = _get_execution_flags(sandbox, docker)
+
+    # Validate backend early (catches Docker issues before we start)
+    try:
+        backend = get_backend(sandbox=sandbox, docker=docker)
+    except RuntimeError as e:
+        print_failure(str(e))
+        return 1
 
     print_header(f"Qualifying: {submitted_path.name}")
-    if sandbox:
+
+    if docker:
+        print_success("✓ Docker backend active")
+        print_dim("  Running in isolated containers (matches server environment)")
+    elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
 
     # Determine seed
@@ -296,8 +330,7 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
 
-    sandbox_flag = " --sandbox" if sandbox else ""
-    print_dim(f"To reproduce this exact run: nashium qualify {submitted_path.name} --seed {seed}{sandbox_flag}")
+    print_dim(f"To reproduce this exact run: nashium qualify {submitted_path.name} --seed {seed}{mode_flags}")
     print()
 
     config = MatchConfig(
@@ -320,12 +353,13 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     # =========== STEP 1: Determinism Check ===========
     determinism_config = config
 
-    # Don't save determinism check output
+    # Note: run_determinism_check creates its own backend, but we already validated above
     is_deterministic, failed_det_opponents = run_determinism_check(
         submitted_path,
         seed,
         determinism_config,
         sandbox=sandbox,
+        docker=docker,
         verbose=False,
         save_output=False,
         save_output_dir=None,
@@ -503,10 +537,24 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     sandbox = getattr(args, 'sandbox', False)
-    mode_str = "sandbox" if sandbox else "local"
+    docker = getattr(args, 'docker', False)
+    mode_str = _get_execution_mode(sandbox, docker)
+    mode_flags = _get_execution_flags(sandbox, docker)
+
+    # Validate backend early
+    try:
+        # Just validate - run_determinism_check creates its own backend
+        _ = get_backend(sandbox=sandbox, docker=docker)
+    except RuntimeError as e:
+        print_failure(str(e))
+        return 1
 
     print_header(f"Checking Determinism: {submitted_path.name}")
-    if sandbox:
+
+    if docker:
+        print_success("✓ Docker backend active")
+        print_dim("  Running in isolated containers (matches server environment)")
+    elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
 
     # Determine seed
@@ -517,8 +565,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
 
-    sandbox_flag = " --sandbox" if sandbox else ""
-    print_dim(f"To reproduce: nashium check {submitted_path.name} --seed {seed}{sandbox_flag}")
+    print_dim(f"To reproduce: nashium check {submitted_path.name} --seed {seed}{mode_flags}")
     print()
 
     config = MatchConfig(
@@ -527,7 +574,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     )
 
     is_deterministic, failed_opponents = run_determinism_check(
-        submitted_path, seed, config, sandbox=sandbox, verbose=True
+        submitted_path, seed, config, sandbox=sandbox, docker=docker, verbose=True
     )
 
     print()
@@ -572,11 +619,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     sandbox = getattr(args, 'sandbox', False)
-    backend = get_backend(sandbox=sandbox)
-    mode_str = "sandbox" if sandbox else "local"
+    docker = getattr(args, 'docker', False)
+    mode_str = _get_execution_mode(sandbox, docker)
+    mode_flags = _get_execution_flags(sandbox, docker)
+
+    # Validate and create backend
+    try:
+        backend = get_backend(sandbox=sandbox, docker=docker)
+    except RuntimeError as e:
+        print_failure(str(e))
+        return 1
 
     print_header(f"Match: {a_path.name} vs {b_path.name}")
-    if sandbox:
+
+    if docker:
+        print_success("✓ Docker backend active")
+        print_dim("  Running in isolated containers (matches server environment)")
+    elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
 
     # Determine seed
@@ -587,8 +646,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         seed = _generate_random_seed()
         print_info(f"Using random seed: {seed}")
 
-    sandbox_flag = " --sandbox" if sandbox else ""
-    print_dim(f"To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}{sandbox_flag}")
+    print_dim(f"To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}{mode_flags}")
     print()
 
     config = MatchConfig(
@@ -598,15 +656,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     save_output = bool(getattr(args, "save_output", False))
 
-    trace = None
+    # Always use the backend now - it handles all three modes uniformly
     if save_output:
-        if sandbox:
-            trace = backend.run_match_trace_between_files(a_path, b_path, seed, config)
-        else:
-            bot_a = load_bot_from_file(a_path, seed)
-            bot_b = load_bot_from_file(b_path, seed)
-            trace = run_match_trace(bot_a, bot_b, config)
-
+        trace = backend.run_match_trace_between_files(a_path, b_path, seed, config)
         summary = trace.summary
 
         # Create output folder
@@ -640,12 +692,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         print_info(f"Saved match logs to: {match_dir}/")
     else:
-        if sandbox:
-            summary = backend.run_match_between_files(a_path, b_path, seed, config)
-        else:
-            bot_a = load_bot_from_file(a_path, seed)
-            bot_b = load_bot_from_file(b_path, seed)
-            summary = run_match(bot_a, bot_b, config)
+        summary = backend.run_match_between_files(a_path, b_path, seed, config)
 
     status, explanation = format_result(
         summary.result, summary.stat_sig, summary.submitted_wins, summary.rounds

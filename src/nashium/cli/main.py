@@ -38,6 +38,7 @@ Examples:
     p_check.add_argument("--seed", type=int, default=None)
     p_check.add_argument("--time-budget", type=float, default=100.0)
     p_check.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
+    p_check.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_check.set_defaults(func=cmd_check)
 
     # Run
@@ -48,6 +49,7 @@ Examples:
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--time-budget", type=float, default=100.0)
     p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
+    p_run.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_run.add_argument(
         "--save-output",
         action="store_true",
@@ -67,6 +69,7 @@ Examples:
     p_qualify.add_argument("--seed", type=int, default=None)
     p_qualify.add_argument("--time-budget", type=float, default=100.0)
     p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
+    p_qualify.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_qualify.add_argument(
         "--save-output",
         action="store_true",

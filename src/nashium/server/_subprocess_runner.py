@@ -10,7 +10,10 @@ import json
 import sys
 import time
 import traceback
+import types
 from dataclasses import dataclass
+
+
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,18 @@ class RoundState:
     round_index: int
     my_history: tuple[int, ...]
     opponent_history: tuple[int, ...]
+
+# Create fake nashium module so "from nashium import RoundState" works
+# This must happen before any bot code is executed
+_fake_nashium = types.ModuleType('nashium')
+_fake_nashium.RoundState = RoundState
+sys.modules['nashium'] = _fake_nashium
+
+# Also support "from nashium.core import RoundState"
+_fake_nashium_core = types.ModuleType('nashium.core')
+_fake_nashium_core.RoundState = RoundState
+sys.modules['nashium.core'] = _fake_nashium_core
+_fake_nashium.core = _fake_nashium_core
 
 
 class BotRunner:

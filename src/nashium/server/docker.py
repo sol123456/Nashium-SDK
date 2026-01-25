@@ -21,7 +21,7 @@ class DockerConfig:
     """Configuration for Docker execution."""
     image: str = "nashium-runner:latest"
     memory_limit: str = "256m"
-    cpu_quota: int = 50000  # 50% of one CPU
+    cpu_quota: int = 50000
     cpu_period: int = 100000
     pids_limit: int = 64
     move_timeout: float = 5.0
@@ -30,9 +30,6 @@ class DockerConfig:
 class DockerExecutor:
     """
     Executes a bot in an isolated Docker container.
-
-    Same interface as SubprocessExecutor - uses delta protocol
-    (opponent_last_move) for efficient communication.
     """
 
     def __init__(
@@ -64,17 +61,26 @@ class DockerExecutor:
         self._time_limit = time_limit
         self._elapsed_time = 0.0
         self._timed_out = False
+        self._errored = False  # NEW: distinguish errors from timeouts
+        self._error_message: str | None = None  # NEW: store error details
         self._closed = False
 
         self._client = docker.from_env()
         self._container: Container | None = None
         self._socket = None
+        self._raw_socket = None
 
         self._response_queue: queue.Queue = queue.Queue()
         self._reader_thread: threading.Thread | None = None
         self._stop_reader = threading.Event()
 
         self._start_container()
+
+    def _get_raw_socket(self, socket):
+        """Get the raw socket, handling platform differences."""
+        if hasattr(socket, '_sock'):
+            return socket._sock
+        return socket
 
     def _start_container(self) -> None:
         """Start Docker container and load bot."""
@@ -107,6 +113,13 @@ class DockerExecutor:
         self._socket = self._container.attach_socket(
             params={"stdout": 1, "stderr": 1, "stdin": 1, "stream": 1}
         )
+        self._raw_socket = self._get_raw_socket(self._socket)
+
+        # Set socket timeout to avoid blocking forever
+        try:
+            self._raw_socket.settimeout(self._config.move_timeout + 1.0)
+        except Exception:
+            pass  # Some socket types don't support this
 
         self._start_reader_thread()
 
@@ -130,7 +143,7 @@ class DockerExecutor:
             buffer = b""
             while not self._stop_reader.is_set():
                 try:
-                    chunk = self._socket._sock.recv(4096)
+                    chunk = self._raw_socket.recv(4096)
                     if not chunk:
                         self._response_queue.put(("eof", None))
                         break
@@ -149,7 +162,8 @@ class DockerExecutor:
                             self._response_queue.put(("ok", decoded))
 
                 except Exception as e:
-                    self._response_queue.put(("error", str(e)))
+                    if not self._stop_reader.is_set():
+                        self._response_queue.put(("error", str(e)))
                     break
 
         self._reader_thread = threading.Thread(target=reader_loop, daemon=True)
@@ -157,12 +171,12 @@ class DockerExecutor:
 
     def _send(self, data: dict) -> None:
         """Send JSON command to container."""
-        if self._socket is None:
+        if self._raw_socket is None:
             raise BotRuntimeError("Container not running", RuntimeError())
 
         try:
             line = json.dumps(data) + "\n"
-            self._socket._sock.send(line.encode())
+            self._raw_socket.send(line.encode())
         except Exception as e:
             self._kill_container()
             raise BotRuntimeError("Failed to send to container", e)
@@ -175,7 +189,7 @@ class DockerExecutor:
             status, data = self._response_queue.get(timeout=timeout)
         except queue.Empty:
             self._kill_container()
-            self._timed_out = True
+            # This is a REAL timeout (per-move)
             raise BotRuntimeError(
                 f"Move timed out after {timeout}s - container killed",
                 TimeoutError()
@@ -211,6 +225,12 @@ class DockerExecutor:
 
         self._stop_reader.set()
 
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except:
+                pass
+
         try:
             self._container.stop(timeout=1)
         except:
@@ -227,14 +247,12 @@ class DockerExecutor:
             pass
 
     def get_move(self, opponent_last_move: int | None) -> int:
-        """
-        Get bot's next move.
-
-        Same interface as SubprocessExecutor.
-        """
-        if self._timed_out or self._closed:
+        """Get bot's next move."""
+        # If already failed, return 0 immediately
+        if self._timed_out or self._errored or self._closed:
             return 0
 
+        # Check cumulative time limit
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
             return 0
@@ -246,17 +264,26 @@ class DockerExecutor:
         try:
             self._send(msg)
             response = self._recv()
-        except BotRuntimeError:
-            self._timed_out = True
+        except BotRuntimeError as e:
+            # Check if it was actually a timeout (per-move timeout from _recv)
+            if isinstance(e.__cause__, TimeoutError):
+                self._timed_out = True
+            else:
+                # Communication error, not a timeout
+                self._errored = True
+                self._error_message = str(e)
             return 0
 
         if response.get("status") == "error":
-            raise BotRuntimeError(response.get("error", "Unknown error"), RuntimeError())
+            self._errored = True
+            self._error_message = response.get("error", "Unknown error")
+            return 0
 
         move = response.get("move", 0)
         elapsed = response.get("time", 0.0)
         self._elapsed_time += elapsed
 
+        # Check cumulative time limit AFTER adding this move's time
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
 
@@ -271,7 +298,18 @@ class DockerExecutor:
 
     @property
     def timed_out(self) -> bool:
+        """True if bot exceeded time limit (not communication errors)."""
         return self._timed_out
+
+    @property
+    def errored(self) -> bool:
+        """True if bot had a communication/runtime error."""
+        return self._errored
+
+    @property
+    def error_message(self) -> str | None:
+        """Error message if errored is True."""
+        return self._error_message
 
     def close(self) -> None:
         """Clean up container."""
