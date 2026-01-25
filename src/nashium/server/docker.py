@@ -61,8 +61,8 @@ class DockerExecutor:
         self._time_limit = time_limit
         self._elapsed_time = 0.0
         self._timed_out = False
-        self._errored = False  # NEW: distinguish errors from timeouts
-        self._error_message: str | None = None  # NEW: store error details
+        self._errored = False
+        self._error_message: str | None = None
         self._closed = False
 
         self._client = docker.from_env()
@@ -115,12 +115,6 @@ class DockerExecutor:
         )
         self._raw_socket = self._get_raw_socket(self._socket)
 
-        # Set socket timeout to avoid blocking forever
-        try:
-            self._raw_socket.settimeout(self._config.move_timeout + 1.0)
-        except Exception:
-            pass  # Some socket types don't support this
-
         self._start_reader_thread()
 
         # Load bot code
@@ -137,10 +131,12 @@ class DockerExecutor:
             raise BotLoadError(error_msg)
 
     def _start_reader_thread(self) -> None:
-        """Background thread that reads container output."""
+        """Background thread that reads and demultiplexes container output."""
 
         def reader_loop():
-            buffer = b""
+            raw_buffer = b""  # Buffer for raw Docker stream data
+            content_buffer = b""  # Buffer for extracted content (headers stripped)
+
             while not self._stop_reader.is_set():
                 try:
                     chunk = self._raw_socket.recv(4096)
@@ -148,15 +144,35 @@ class DockerExecutor:
                         self._response_queue.put(("eof", None))
                         break
 
-                    buffer += chunk
+                    raw_buffer += chunk
 
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
+                    # Parse Docker multiplexed frames and extract content
+                    # Frame format: [1 byte type][3 bytes padding][4 bytes size][payload]
+                    while len(raw_buffer) >= 8:
+                        # Check for valid Docker header
+                        stream_type = raw_buffer[0]
+                        padding = raw_buffer[1:4]
 
-                        # Docker multiplexed stream has 8-byte header
-                        if len(line) >= 8 and line[0:1] in (b"\x01", b"\x02"):
-                            line = line[8:]
+                        if stream_type in (1, 2) and padding == b"\x00\x00\x00":
+                            # Valid Docker header
+                            payload_size = int.from_bytes(raw_buffer[4:8], 'big')
+                            frame_size = 8 + payload_size
 
+                            if len(raw_buffer) < frame_size:
+                                break  # Need more data for complete frame
+
+                            # Extract payload (skip 8-byte header)
+                            content_buffer += raw_buffer[8:frame_size]
+                            raw_buffer = raw_buffer[frame_size:]
+                        else:
+                            # Not a Docker header - shouldn't happen, but handle gracefully
+                            # Move one byte to content and continue
+                            content_buffer += raw_buffer[:1]
+                            raw_buffer = raw_buffer[1:]
+
+                    # Extract complete lines from content buffer
+                    while b"\n" in content_buffer:
+                        line, content_buffer = content_buffer.split(b"\n", 1)
                         decoded = line.decode("utf-8").strip()
                         if decoded:
                             self._response_queue.put(("ok", decoded))
@@ -189,7 +205,6 @@ class DockerExecutor:
             status, data = self._response_queue.get(timeout=timeout)
         except queue.Empty:
             self._kill_container()
-            # This is a REAL timeout (per-move)
             raise BotRuntimeError(
                 f"Move timed out after {timeout}s - container killed",
                 TimeoutError()
@@ -248,11 +263,9 @@ class DockerExecutor:
 
     def get_move(self, opponent_last_move: int | None) -> int:
         """Get bot's next move."""
-        # If already failed, return 0 immediately
         if self._timed_out or self._errored or self._closed:
             return 0
 
-        # Check cumulative time limit
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
             return 0
@@ -265,11 +278,9 @@ class DockerExecutor:
             self._send(msg)
             response = self._recv()
         except BotRuntimeError as e:
-            # Check if it was actually a timeout (per-move timeout from _recv)
             if isinstance(e.__cause__, TimeoutError):
                 self._timed_out = True
             else:
-                # Communication error, not a timeout
                 self._errored = True
                 self._error_message = str(e)
             return 0
@@ -283,7 +294,6 @@ class DockerExecutor:
         elapsed = response.get("time", 0.0)
         self._elapsed_time += elapsed
 
-        # Check cumulative time limit AFTER adding this move's time
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
 
@@ -298,17 +308,14 @@ class DockerExecutor:
 
     @property
     def timed_out(self) -> bool:
-        """True if bot exceeded time limit (not communication errors)."""
         return self._timed_out
 
     @property
     def errored(self) -> bool:
-        """True if bot had a communication/runtime error."""
         return self._errored
 
     @property
     def error_message(self) -> str | None:
-        """Error message if errored is True."""
         return self._error_message
 
     def close(self) -> None:

@@ -194,6 +194,7 @@ class _IsolatedBackend(Backend):
                 submitted_wins = 0
                 last_submitted_move: int | None = None
                 last_opponent_effective: int | None = None
+                rounds_played = 0
 
                 if capture_history:
                     submitted_history: list[int] = []
@@ -215,8 +216,13 @@ class _IsolatedBackend(Backend):
 
                     last_submitted_move = s_move
                     last_opponent_effective = o_move
+                    rounds_played += 1
 
                 wall_time = time.perf_counter() - start
+
+                # Check for errors (distinct from timeouts)
+                submitted_errored = getattr(submitted, 'errored', False)
+                opponent_errored = getattr(opponent, 'errored', False)
 
                 stat_sig = (
                         submitted_wins >= config.stat_sig_win_threshold
@@ -246,6 +252,14 @@ class _IsolatedBackend(Backend):
                     submitted_timed_out=submitted.timed_out,
                     leaderboard_timed_out=opponent.timed_out,
                 )
+
+                # Log errors for debugging (optional)
+                if submitted_errored:
+                    error_msg = getattr(submitted, 'error_message', 'Unknown')
+                    print(f"DEBUG: Submitted bot errored: {error_msg}")
+                if opponent_errored:
+                    error_msg = getattr(opponent, 'error_message', 'Unknown')
+                    print(f"DEBUG: Opponent bot errored: {error_msg}")
 
                 if capture_history:
                     return MatchTrace(
