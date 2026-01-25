@@ -10,7 +10,6 @@ from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
 try:
     import docker
     from docker.models.containers import Container
-
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False
@@ -39,6 +38,7 @@ class DockerExecutor:
             move_timeout: float = 5.0,
             seed: int | None = None,
             config: DockerConfig | None = None,
+            name: str = "Bot",
     ):
         if not DOCKER_AVAILABLE:
             raise RuntimeError(
@@ -64,6 +64,7 @@ class DockerExecutor:
         self._errored = False
         self._error_message: str | None = None
         self._closed = False
+        self._name = name
 
         self._client = docker.from_env()
         self._container: Container | None = None
@@ -84,6 +85,8 @@ class DockerExecutor:
 
     def _start_container(self) -> None:
         """Start Docker container and load bot."""
+        print(f"  [{self._name}] Starting container...", end="", flush=True)
+
         try:
             self._container = self._client.containers.run(
                 image=self._config.image,
@@ -100,16 +103,21 @@ class DockerExecutor:
                 remove=False,
             )
         except docker.errors.ImageNotFound:
+            print(" FAILED", flush=True)
             raise RuntimeError(
                 f"Docker image '{self._config.image}' not found.\n"
                 f"Build with: docker build -t {self._config.image} src/nashium/server/"
             )
         except docker.errors.APIError as e:
+            print(" FAILED", flush=True)
             raise RuntimeError(f"Docker API error: {e}")
         except Exception as e:
+            print(" FAILED", flush=True)
             raise RuntimeError(f"Failed to start container: {e}")
 
-        # Attach socket for bidirectional communication
+        print(" started", flush=True)
+
+        # Attach socket
         self._socket = self._container.attach_socket(
             params={"stdout": 1, "stderr": 1, "stdin": 1, "stream": 1}
         )
@@ -118,6 +126,8 @@ class DockerExecutor:
         self._start_reader_thread()
 
         # Load bot code
+        print(f"  [{self._name}] Loading bot...", end="", flush=True)
+
         load_cmd = {"cmd": "load", "code": self._bot_code}
         if self._seed is not None:
             load_cmd["seed"] = self._seed
@@ -126,16 +136,18 @@ class DockerExecutor:
         response = self._recv(timeout=10.0)
 
         if response.get("status") != "ok":
+            print(" FAILED", flush=True)
             error_msg = response.get("error", "Failed to load bot")
             self.close()
             raise BotLoadError(error_msg)
 
+        print(" ready ✓", flush=True)
+
     def _start_reader_thread(self) -> None:
         """Background thread that reads and demultiplexes container output."""
-
         def reader_loop():
-            raw_buffer = b""  # Buffer for raw Docker stream data
-            content_buffer = b""  # Buffer for extracted content (headers stripped)
+            raw_buffer = b""
+            content_buffer = b""
 
             while not self._stop_reader.is_set():
                 try:
@@ -146,31 +158,23 @@ class DockerExecutor:
 
                     raw_buffer += chunk
 
-                    # Parse Docker multiplexed frames and extract content
-                    # Frame format: [1 byte type][3 bytes padding][4 bytes size][payload]
                     while len(raw_buffer) >= 8:
-                        # Check for valid Docker header
                         stream_type = raw_buffer[0]
                         padding = raw_buffer[1:4]
 
                         if stream_type in (1, 2) and padding == b"\x00\x00\x00":
-                            # Valid Docker header
                             payload_size = int.from_bytes(raw_buffer[4:8], 'big')
                             frame_size = 8 + payload_size
 
                             if len(raw_buffer) < frame_size:
-                                break  # Need more data for complete frame
+                                break
 
-                            # Extract payload (skip 8-byte header)
                             content_buffer += raw_buffer[8:frame_size]
                             raw_buffer = raw_buffer[frame_size:]
                         else:
-                            # Not a Docker header - shouldn't happen, but handle gracefully
-                            # Move one byte to content and continue
                             content_buffer += raw_buffer[:1]
                             raw_buffer = raw_buffer[1:]
 
-                    # Extract complete lines from content buffer
                     while b"\n" in content_buffer:
                         line, content_buffer = content_buffer.split(b"\n", 1)
                         decoded = line.decode("utf-8").strip()

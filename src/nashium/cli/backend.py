@@ -396,14 +396,13 @@ def get_backend(
     docker: bool = False,
     move_timeout: float = 5.0,
 ) -> Backend:
-    """
-    Get the appropriate backend.
+    """Get the appropriate backend."""
 
-    Args:
-        sandbox: Use subprocess isolation
-        docker: Use Docker container isolation (overrides sandbox)
-        move_timeout: Timeout per move in seconds
-    """
+    # Args:
+    #     sandbox: Use subprocess isolation
+    #     docker: Use Docker container isolation (overrides sandbox)
+    #     move_timeout: Timeout per move in seconds
+
     if docker:
         return DockerBackend(move_timeout=move_timeout)
     elif sandbox:
