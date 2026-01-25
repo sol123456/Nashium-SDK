@@ -34,7 +34,7 @@ Examples:
     # Check
     p_check = sub.add_parser("check", help="Verify your bot is deterministic")
     p_check.add_argument("bot", help="Your bot file")
-    p_check.add_argument("--rounds", type=int, default=2_000)
+    p_check.add_argument("--rounds", type=int, default=10_000)
     p_check.add_argument("--seed", type=int, default=None)
     p_check.add_argument("--time-budget", type=float, default=100.0)
     p_check.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")

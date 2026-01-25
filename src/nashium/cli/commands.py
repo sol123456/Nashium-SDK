@@ -305,23 +305,33 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
+    save_output = bool(getattr(args, "save_output", False))
+
+    # Create output directory structure if saving
+    output_base_dir = None
+    if save_output:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        bot_stem = submitted_path.stem
+        output_base_dir = Path("nashium_match_logs") / f"{bot_stem}_qualifier_{timestamp}"
+        output_base_dir.mkdir(parents=True, exist_ok=True)
+        print_info(f"Saving match logs to: {output_base_dir}/")
+
     # =========== STEP 1: Determinism Check ===========
     determinism_config = MatchConfig(
         rounds=2000,
         max_total_time_seconds_per_bot=args.time_budget,
     )
 
-    save_output = bool(getattr(args, "save_output", False))
-    save_output_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs"))
-
+    # Don't save determinism check output
     is_deterministic, failed_det_opponents = run_determinism_check(
         submitted_path,
         seed,
         determinism_config,
         sandbox=sandbox,
         verbose=False,
-        save_output=save_output,
-        save_output_dir=save_output_dir,
+        save_output=False,
+        save_output_dir=None,
     )
 
     if is_deterministic:
@@ -339,21 +349,36 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     any_timed_out = False
 
     for name, opponent_source in opponents:
-        if save_output:
+        if save_output and output_base_dir:
             trace = backend.run_match_trace_file_vs_source(submitted_path, opponent_source, seed, config)
             summary = trace.summary
 
+            # Create subfolder: "my_bot3.py vs always_heads (seed 123456789)"
+            match_folder_name = f"{submitted_path.name} vs {name} (seed {seed})"
+            match_dir = output_base_dir / match_folder_name
+            match_dir.mkdir(parents=True, exist_ok=True)
+
+            bot_stem = submitted_path.stem
+
+            # Write output file (bot's moves)
+            output_file = match_dir / f"{bot_stem}_output.txt"
             submitted_outputs = "\n".join(str(x) for x in trace.submitted_moves)
             if submitted_outputs:
                 submitted_outputs += "\n"
+            output_file.write_text(submitted_outputs)
 
-            _write_match_logs(
-                out_dir=save_output_dir,
-                match_label=f"{submitted_path.name} vs {name}",
-                seed=seed,
-                trace=trace,
-                captured_output=submitted_outputs,
-            )
+            # Calculate per-round wins (1 = submitted bot won, 0 = lost)
+            per_round_wins = [
+                1 if s_move != o_move else 0
+                for s_move, o_move in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
+            ]
+
+            # Write score file
+            score_file = match_dir / f"{bot_stem}_score.txt"
+            scores = "\n".join(str(x) for x in per_round_wins)
+            if scores:
+                scores += "\n"
+            score_file.write_text(scores)
         else:
             summary = backend.run_match_file_vs_source(submitted_path, opponent_source, seed, config)
 
@@ -575,7 +600,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     save_output = bool(getattr(args, "save_output", False))
-    save_output_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs"))
 
     trace = None
     if save_output:
@@ -587,17 +611,37 @@ def cmd_run(args: argparse.Namespace) -> int:
             trace = run_match_trace(bot_a, bot_b, config)
 
         summary = trace.summary
+
+        # Create output folder
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        match_folder_name = f"{a_path.name} vs {b_path.name} (seed {seed}) {timestamp}"
+        match_dir = Path("nashium_match_logs") / match_folder_name
+        match_dir.mkdir(parents=True, exist_ok=True)
+
+        a_stem = a_path.stem
+
+        # Write output file (bot_a's moves)
+        output_file = match_dir / f"{a_stem}_output.txt"
         submitted_outputs = "\n".join(str(x) for x in trace.submitted_moves)
         if submitted_outputs:
             submitted_outputs += "\n"
+        output_file.write_text(submitted_outputs)
 
-        _write_match_logs(
-            out_dir=save_output_dir,
-            match_label=f"{a_path.name} vs {b_path.name}",
-            seed=seed,
-            trace=trace,
-            captured_output=submitted_outputs,
-        )
+        # Calculate per-round wins (1 = bot_a won, 0 = lost)
+        per_round_wins = [
+            1 if s_move != o_move else 0
+            for s_move, o_move in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
+        ]
+
+        # Write score file
+        score_file = match_dir / f"{a_stem}_score.txt"
+        scores = "\n".join(str(x) for x in per_round_wins)
+        if scores:
+            scores += "\n"
+        score_file.write_text(scores)
+
+        print_info(f"Saved match logs to: {match_dir}/")
     else:
         if sandbox:
             summary = backend.run_match_between_files(a_path, b_path, seed, config)
