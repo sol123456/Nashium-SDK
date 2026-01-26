@@ -9,6 +9,7 @@ from .backend import get_backend
 from .formatting import (
     Colors,
     format_result,
+    format_memory_warning,
     format_time_warning,
     print_dim,
     print_failure,
@@ -31,6 +32,48 @@ def _safe_filename_component(value: str) -> str:
     cleaned = re.sub(r"[<>:\"/\\|?*]", "_", value)
     cleaned = cleaned.strip().rstrip(".")
     return cleaned or "match"
+
+
+def _parse_memory_limit_bytes(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    s = str(value).strip().lower()
+    if not s:
+        return None
+
+    try:
+        return int(s)
+    except ValueError:
+        pass
+
+    units = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 * 1024,
+        "mb": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+    }
+    for suffix, mult in units.items():
+        if s.endswith(suffix):
+            num = s[: -len(suffix)].strip()
+            try:
+                return int(float(num) * mult)
+            except ValueError:
+                raise ValueError(f"Invalid memory limit: {value!r}")
+
+    raise ValueError(f"Invalid memory limit: {value!r}")
+
+
+def _get_effective_memory_limit_bytes(*, sandbox: bool, docker: bool, arg_value: str | None) -> int | None:
+    if not (sandbox or docker):
+        return None
+
+    if arg_value is None:
+        return 200 * 1024 * 1024
+
+    return _parse_memory_limit_bytes(arg_value)
 
 
 def _unique_path(path: Path) -> Path:
@@ -321,6 +364,9 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         print_dim("  Running in isolated containers (matches server environment)")
     elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
+    else:
+        print_warning("RAM usage is not measured in local mode (both bots share one Python process).")
+        print_dim("Use --sandbox for host-measured RAM usage and enforcement.")
 
     # Determine seed
     if args.seed is not None:
@@ -333,9 +379,20 @@ def cmd_qualify(args: argparse.Namespace) -> int:
     print_dim(f"To reproduce this exact run: nashium qualify {submitted_path.name} --seed {seed}{mode_flags}")
     print()
 
+    try:
+        memory_limit_bytes = _get_effective_memory_limit_bytes(
+            sandbox=sandbox,
+            docker=docker,
+            arg_value=getattr(args, "memory", None),
+        )
+    except ValueError as e:
+        print_failure(str(e))
+        return 1
+
     config = MatchConfig(
         rounds=args.rounds,
         max_total_time_seconds_per_bot=args.time_budget,
+        max_total_memory_bytes_per_bot=memory_limit_bytes,
     )
 
     save_output = bool(getattr(args, "save_output", False))
@@ -346,7 +403,7 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         bot_stem = submitted_path.stem
-        output_base_dir = Path("nashium_match_logs") / f"{bot_stem}_qualifier_{timestamp}"
+        output_base_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs")) / f"{bot_stem}_qualifier_{timestamp}"
         output_base_dir.mkdir(parents=True, exist_ok=True)
         print_info(f"Saving match logs to: {output_base_dir}/")
 
@@ -376,8 +433,10 @@ def cmd_qualify(args: argparse.Namespace) -> int:
 
     results = []
     max_time_used = 0.0
+    max_mem_used: int | None = None
     all_pass = True
     any_timed_out = False
+    any_mem_exceeded = False
 
     for name, opponent_source in opponents:
         if save_output and output_base_dir:
@@ -410,14 +469,34 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             if scores:
                 scores += "\n"
             score_file.write_text(scores)
+
+            if sandbox or docker:
+                usage_dir = match_dir / "usage"
+                usage_dir.mkdir(parents=True, exist_ok=True)
+                (usage_dir / "cpu_usage.txt").write_text(
+                    "\n".join(str(x) for x in trace.submitted_cpu_usage_samples)
+                    + ("\n" if trace.submitted_cpu_usage_samples else ""),
+                    encoding="utf-8",
+                )
+                (usage_dir / "ram_usage.txt").write_text(
+                    "\n".join(str(x) for x in trace.submitted_ram_usage_samples)
+                    + ("\n" if trace.submitted_ram_usage_samples else ""),
+                    encoding="utf-8",
+                )
         else:
             summary = backend.run_match_file_vs_source(submitted_path, opponent_source, seed, config)
 
         max_time_used = max(max_time_used, summary.submitted_time_seconds)
+        if summary.submitted_memory_bytes_peak is not None:
+            if max_mem_used is None or summary.submitted_memory_bytes_peak > max_mem_used:
+                max_mem_used = summary.submitted_memory_bytes_peak
         passed = summary.result == InteractionResult.S_WIN and summary.stat_sig
 
         if summary.submitted_timed_out:
             any_timed_out = True
+
+        if summary.submitted_memory_exceeded:
+            any_mem_exceeded = True
 
         status, explanation = format_result(
             summary.result, summary.stat_sig, summary.submitted_wins, summary.rounds
@@ -433,14 +512,16 @@ def cmd_qualify(args: argparse.Namespace) -> int:
             'win_rate': summary.submitted_win_rate,
             'time': summary.submitted_time_seconds,
             'timed_out': summary.submitted_timed_out,
+            'mem_peak': summary.submitted_memory_bytes_peak,
+            'mem_exceeded': summary.submitted_memory_exceeded,
         })
 
         if not passed:
             all_pass = False
 
     # Print results table
-    print(f"  {'Opponent':<20} {'Result':<25} {'Win Rate':<12} {'Time':<10}")
-    print(f"  {'-' * 20} {'-' * 25} {'-' * 12} {'-' * 10}")
+    print(f"  {'Opponent':<20} {'Result':<25} {'Win Rate':<12} {'Time':<10} {'Mem':<10}")
+    print(f"  {'-' * 20} {'-' * 25} {'-' * 12} {'-' * 10} {'-' * 10}")
 
     for r in results:
         win_rate_str = f"{r['win_rate'] * 100:.1f}%"
@@ -448,12 +529,20 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         if r['timed_out']:
             time_str += " ⏱"
 
+        mem_peak = r.get('mem_peak')
+        if mem_peak is None:
+            mem_str = "n/a"
+        else:
+            mem_str = f"{mem_peak / (1024 * 1024):.1f}MB"
+        if r.get('mem_exceeded'):
+            mem_str += " !"
+
         if r['passed']:
             icon = f"{Colors.GREEN}✓{Colors.RESET}"
         else:
             icon = f"{Colors.RED}✗{Colors.RESET}"
 
-        print(f"  {icon} {r['name']:<18} {r['status']:<35} {win_rate_str:<12} {time_str:<10}")
+        print(f"  {icon} {r['name']:<18} {r['status']:<35} {win_rate_str:<12} {time_str:<10} {mem_str:<10}")
 
     print()
 
@@ -462,9 +551,20 @@ def cmd_qualify(args: argparse.Namespace) -> int:
         print_dim("When a bot times out, it defaults to playing 0 for all remaining rounds.")
         print()
 
+    if any_mem_exceeded:
+        print_warning("Your bot exceeded the memory limit in one or more matches!")
+        print_dim("When a bot exceeds memory, it defaults to playing 0 for all remaining rounds.")
+        print()
+
     print(f"  {Colors.BOLD}Time Analysis:{Colors.RESET}")
     print(f"    {format_time_warning(max_time_used, args.time_budget)}")
     print()
+
+    if config.max_total_memory_bytes_per_bot is not None and max_mem_used is not None:
+        print(f"  {Colors.BOLD}Memory Analysis:{Colors.RESET}")
+        print(f"    {format_memory_warning(max_mem_used, config.max_total_memory_bytes_per_bot)}")
+        print_dim("    (Limit includes Python/runtime overhead.)")
+        print()
 
     # =========== FINAL VERDICT ===========
     qualified = all_pass and is_deterministic
@@ -556,6 +656,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         print_dim("  Running in isolated containers (matches server environment)")
     elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
+    else:
+        print_warning("RAM usage is not measured in local mode (both bots share one Python process).")
+        print_dim("Use --sandbox for host-measured RAM usage and enforcement.")
 
     # Determine seed
     if args.seed is not None:
@@ -568,9 +671,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     print_dim(f"To reproduce: nashium check {submitted_path.name} --seed {seed}{mode_flags}")
     print()
 
+    try:
+        memory_limit_bytes = _get_effective_memory_limit_bytes(
+            sandbox=sandbox,
+            docker=docker,
+            arg_value=getattr(args, "memory", None),
+        )
+    except ValueError as e:
+        print_failure(str(e))
+        return 1
+
     config = MatchConfig(
         rounds=args.rounds,
         max_total_time_seconds_per_bot=args.time_budget,
+        max_total_memory_bytes_per_bot=memory_limit_bytes,
     )
 
     is_deterministic, failed_opponents = run_determinism_check(
@@ -637,6 +751,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print_dim("  Running in isolated containers (matches server environment)")
     elif sandbox:
         print_dim(f"Execution mode: {mode_str}")
+    else:
+        print_warning("RAM usage is not measured in local mode (both bots share one Python process).")
+        print_dim("Use --sandbox for host-measured RAM usage and enforcement.")
 
     # Determine seed
     if args.seed is not None:
@@ -649,9 +766,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     print_dim(f"To reproduce: nashium run {a_path.name} {b_path.name} --seed {seed}{mode_flags}")
     print()
 
+    try:
+        memory_limit_bytes = _get_effective_memory_limit_bytes(
+            sandbox=sandbox,
+            docker=docker,
+            arg_value=getattr(args, "memory", None),
+        )
+    except ValueError as e:
+        print_failure(str(e))
+        return 1
+
     config = MatchConfig(
         rounds=args.rounds,
         max_total_time_seconds_per_bot=args.time_budget,
+        max_total_memory_bytes_per_bot=memory_limit_bytes,
     )
 
     save_output = bool(getattr(args, "save_output", False))
@@ -665,7 +793,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         match_folder_name = f"{a_path.name} vs {b_path.name} (seed {seed}) {timestamp}"
-        match_dir = Path("nashium_match_logs") / match_folder_name
+        match_dir = Path(getattr(args, "save_output_dir", "nashium_match_logs")) / match_folder_name
         match_dir.mkdir(parents=True, exist_ok=True)
 
         a_stem = a_path.stem
@@ -689,6 +817,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         if scores:
             scores += "\n"
         score_file.write_text(scores)
+
+        if sandbox or docker:
+            usage_dir = match_dir / "usage"
+            usage_dir.mkdir(parents=True, exist_ok=True)
+            (usage_dir / "cpu_usage.txt").write_text(
+                "\n".join(str(x) for x in trace.submitted_cpu_usage_samples)
+                + ("\n" if trace.submitted_cpu_usage_samples else ""),
+                encoding="utf-8",
+            )
+            (usage_dir / "ram_usage.txt").write_text(
+                "\n".join(str(x) for x in trace.submitted_ram_usage_samples)
+                + ("\n" if trace.submitted_ram_usage_samples else ""),
+                encoding="utf-8",
+            )
 
         print_info(f"Saved match logs to: {match_dir}/")
     else:
@@ -716,10 +858,30 @@ def cmd_run(args: argparse.Namespace) -> int:
             print_warning(f"{b_path.name} exceeded time limit and defaulted to 0 for remaining moves")
         print()
 
+    if summary.submitted_memory_exceeded or summary.leaderboard_memory_exceeded:
+        print(f"  {Colors.BOLD}Memory Limits:{Colors.RESET}")
+        if summary.submitted_memory_exceeded:
+            print_warning(f"{a_path.name} exceeded memory limit and defaulted to 0 for remaining moves")
+        if summary.leaderboard_memory_exceeded:
+            print_warning(f"{b_path.name} exceeded memory limit and defaulted to 0 for remaining moves")
+        print()
+
     print(f"  {Colors.BOLD}Performance:{Colors.RESET}")
     print(f"    {a_path.name} time: {summary.submitted_time_seconds:.3f}s")
     print(f"    {b_path.name} time: {summary.leaderboard_time_seconds:.3f}s")
     print(f"    Total wall time:   {summary.wall_time_seconds:.3f}s")
+    if summary.submitted_memory_bytes_peak is not None:
+        print(f"    {a_path.name} peak RAM: {summary.submitted_memory_bytes_peak / (1024 * 1024):.1f}MB")
+    else:
+        print(f"    {a_path.name} peak RAM: n/a")
+    if summary.leaderboard_memory_bytes_peak is not None:
+        print(f"    {b_path.name} peak RAM: {summary.leaderboard_memory_bytes_peak / (1024 * 1024):.1f}MB")
+    else:
+        print(f"    {b_path.name} peak RAM: n/a")
+
+    if config.max_total_memory_bytes_per_bot is not None and summary.submitted_memory_bytes_peak is not None:
+        print(f"    {a_path.name} memory: {format_memory_warning(summary.submitted_memory_bytes_peak, config.max_total_memory_bytes_per_bot)}")
+        print_dim("    (Limit includes Python/runtime overhead.)")
     print()
 
     return 0

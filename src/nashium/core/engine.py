@@ -29,6 +29,7 @@ class MatchConfig:
     rounds: int = 10_000
     stat_sig_win_threshold: int = 5155
     max_total_time_seconds_per_bot: float = 100.0
+    max_total_memory_bytes_per_bot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,10 @@ class MatchSummary:
     wall_time_seconds: float
     submitted_timed_out: bool = False
     leaderboard_timed_out: bool = False
+    submitted_memory_bytes_peak: int | None = None
+    leaderboard_memory_bytes_peak: int | None = None
+    submitted_memory_exceeded: bool = False
+    leaderboard_memory_exceeded: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,8 @@ class MatchTrace:
     submitted_moves: tuple[int, ...]
     leaderboard_moves_raw: tuple[int, ...]
     leaderboard_moves_effective: tuple[int, ...]
+    submitted_cpu_usage_samples: tuple[int, ...] = ()
+    submitted_ram_usage_samples: tuple[int, ...] = ()
 
 
 def _compute_result(submitted_wins: int, config: MatchConfig) -> tuple[InteractionResult, bool]:

@@ -23,7 +23,7 @@ except ImportError:
 @dataclass
 class DockerConfig:
     image: str = "nashium-runner:latest"
-    memory_limit: str = "200m"
+    memory_limit: str | int = "200m"
     cpu_quota: int = 50000
     cpu_period: int = 100000
     pids_limit: int = 64
@@ -68,6 +68,9 @@ class DockerExecutor:
         self._timed_out = False
         self._errored = False
         self._error_message: str | None = None
+        self._memory_bytes_peak: int | None = None
+        self._memory_bytes_current: int | None = None
+        self._memory_exceeded = False
         self._closed = False
 
         self._client = docker.from_env()
@@ -77,6 +80,56 @@ class DockerExecutor:
         self._conn: socket.socket | None = None
 
         self._start(bot_code, seed)
+
+    def _parse_memory_limit_bytes(self) -> int | None:
+        limit = self._config.memory_limit
+        if isinstance(limit, int):
+            return limit
+        if not isinstance(limit, str):
+            return None
+
+        s = limit.strip().lower()
+        try:
+            return int(s)
+        except ValueError:
+            pass
+
+        units = {
+            "k": 1024,
+            "kb": 1024,
+            "m": 1024 * 1024,
+            "mb": 1024 * 1024,
+            "g": 1024 * 1024 * 1024,
+            "gb": 1024 * 1024 * 1024,
+        }
+        for suffix, mult in units.items():
+            if s.endswith(suffix):
+                num = s[: -len(suffix)].strip()
+                try:
+                    return int(float(num) * mult)
+                except ValueError:
+                    return None
+        return None
+
+    def poll_usage(self) -> None:
+        if self._container is None:
+            return
+
+        try:
+            stats = self._container.stats(stream=False)
+        except Exception:
+            return
+
+        mem_stats = stats.get("memory_stats") or {}
+        current = mem_stats.get("usage")
+        if isinstance(current, int):
+            self._memory_bytes_current = current
+        peak = mem_stats.get("max_usage")
+        if peak is None:
+            peak = current
+        if isinstance(peak, int):
+            if self._memory_bytes_peak is None or peak > self._memory_bytes_peak:
+                self._memory_bytes_peak = peak
 
     def _start(self, bot_code: str, seed: int | None) -> None:
         print(f"  [{self._name}] Starting container...", end="", flush=True)
@@ -177,7 +230,7 @@ class DockerExecutor:
         return bytes(data)
 
     def get_move(self, opponent_last_move: int | None) -> int:
-        if self._timed_out or self._errored or self._closed:
+        if self._timed_out or self._errored or self._closed or self._memory_exceeded:
             return 0
 
         if self._elapsed_time > self._time_limit:
@@ -198,6 +251,7 @@ class DockerExecutor:
             self._elapsed_time += time.perf_counter() - start
             self._errored = True
             self._error_message = f"Send failed: {e}"
+            self._check_oom_killed()
             return 0
 
         try:
@@ -211,6 +265,7 @@ class DockerExecutor:
             self._elapsed_time += time.perf_counter() - start
             self._errored = True
             self._error_message = f"Recv failed: {e}"
+            self._check_oom_killed()
             return 0
 
         elapsed = time.perf_counter() - start
@@ -219,6 +274,7 @@ class DockerExecutor:
             self._elapsed_time += elapsed
             self._errored = True
             self._error_message = "Incomplete response"
+            self._check_oom_killed()
             return 0
 
         status, move = resp[0], resp[1]
@@ -238,6 +294,21 @@ class DockerExecutor:
             raise InvalidMoveError(f"Invalid move: {move}")
 
         return move
+
+    def _check_oom_killed(self) -> None:
+        if self._container is None:
+            return
+
+        try:
+            self._container.reload()
+            state = (self._container.attrs or {}).get("State") or {}
+            if state.get("OOMKilled"):
+                self._memory_exceeded = True
+                self._errored = False
+                self._error_message = "Container was OOM-killed"
+                self.poll_usage()
+        except Exception:
+            return
 
     def _cleanup_socket(self) -> None:
         if self._conn:
@@ -275,6 +346,18 @@ class DockerExecutor:
     @property
     def timed_out(self) -> bool:
         return self._timed_out
+
+    @property
+    def memory_bytes_peak(self) -> int | None:
+        return self._memory_bytes_peak
+
+    @property
+    def memory_bytes_current(self) -> int | None:
+        return self._memory_bytes_current
+
+    @property
+    def memory_exceeded(self) -> bool:
+        return self._memory_exceeded
 
     @property
     def errored(self) -> bool:

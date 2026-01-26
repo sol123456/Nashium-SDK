@@ -200,6 +200,10 @@ class _IsolatedBackend(Backend):
                     submitted_history: list[int] = []
                     opponent_raw_history: list[int] = []
                     opponent_effective_history: list[int] = []
+                    submitted_cpu_usage_samples: list[int] = []
+                    submitted_ram_usage_samples: list[int] = []
+
+                    sample_interval = max(1, int(config.rounds * 0.005))
 
                 for _ in range(config.rounds):
                     s_move = submitted.get_move(last_opponent_effective)
@@ -218,7 +222,37 @@ class _IsolatedBackend(Backend):
                     last_opponent_effective = o_move
                     rounds_played += 1
 
+                    if capture_history and (
+                            rounds_played % sample_interval == 0
+                            or rounds_played == config.rounds
+                    ):
+                        poll = getattr(submitted, "poll_usage", None)
+                        if callable(poll):
+                            poll()
+
+                        time_budget = config.max_total_time_seconds_per_bot
+                        cpu_frac = (submitted.elapsed_time / time_budget) if time_budget else 0.0
+                        cpu_scaled = int(max(0.0, min(1.0, cpu_frac)) * 1000)
+                        submitted_cpu_usage_samples.append(cpu_scaled)
+
+                        mem_budget = config.max_total_memory_bytes_per_bot
+                        mem_current = getattr(submitted, "memory_bytes_current", None)
+                        if mem_current is None:
+                            mem_current = getattr(submitted, "memory_bytes_peak", None)
+
+                        if mem_budget and mem_current is not None:
+                            mem_frac = mem_current / mem_budget
+                            mem_scaled = int(max(0.0, min(1.0, mem_frac)) * 1000)
+                        else:
+                            mem_scaled = 0
+                        submitted_ram_usage_samples.append(mem_scaled)
+
                 wall_time = time.perf_counter() - start
+
+                for ex in (submitted, opponent):
+                    poll = getattr(ex, "poll_usage", None)
+                    if callable(poll):
+                        poll()
 
                 # Check for errors (distinct from timeouts)
                 submitted_errored = getattr(submitted, 'errored', False)
@@ -251,6 +285,10 @@ class _IsolatedBackend(Backend):
                     wall_time_seconds=wall_time,
                     submitted_timed_out=submitted.timed_out,
                     leaderboard_timed_out=opponent.timed_out,
+                    submitted_memory_bytes_peak=getattr(submitted, "memory_bytes_peak", None),
+                    leaderboard_memory_bytes_peak=getattr(opponent, "memory_bytes_peak", None),
+                    submitted_memory_exceeded=getattr(submitted, "memory_exceeded", False),
+                    leaderboard_memory_exceeded=getattr(opponent, "memory_exceeded", False),
                 )
 
                 # Log errors for debugging (optional)
@@ -267,6 +305,8 @@ class _IsolatedBackend(Backend):
                         submitted_moves=tuple(submitted_history),
                         leaderboard_moves_raw=tuple(opponent_raw_history),
                         leaderboard_moves_effective=tuple(opponent_effective_history),
+                        submitted_cpu_usage_samples=tuple(submitted_cpu_usage_samples),
+                        submitted_ram_usage_samples=tuple(submitted_ram_usage_samples),
                     )
                 return summary
 
@@ -335,6 +375,7 @@ class SandboxBackend(_IsolatedBackend):
             source,
             time_limit=config.max_total_time_seconds_per_bot,
             seed=seed,
+            memory_limit_bytes=config.max_total_memory_bytes_per_bot,
         )
 
 
@@ -380,12 +421,13 @@ class DockerBackend(_IsolatedBackend):
         return "docker container"
 
     def _create_executor(self, source: str, seed: int, config: MatchConfig):
-        from ..server.docker import DockerExecutor
+        from ..server.docker import DockerConfig, DockerExecutor
 
         return DockerExecutor(
             source,
             time_limit=config.max_total_time_seconds_per_bot,
             seed=seed,
+            config=DockerConfig(memory_limit=(config.max_total_memory_bytes_per_bot or "200m")),
         )
 
 

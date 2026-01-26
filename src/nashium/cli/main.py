@@ -37,6 +37,11 @@ Examples:
     p_check.add_argument("--rounds", type=int, default=10_000)
     p_check.add_argument("--seed", type=int, default=None)
     p_check.add_argument("--time-budget", type=float, default=100.0)
+    p_check.add_argument(
+        "--memory",
+        default=None,
+        help="Memory limit per bot for --sandbox/--docker (e.g. 200m, 200mb, 209715200)",
+    )
     p_check.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_check.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_check.set_defaults(func=cmd_check)
@@ -48,6 +53,11 @@ Examples:
     p_run.add_argument("--rounds", type=int, default=10_000)
     p_run.add_argument("--seed", type=int, default=None)
     p_run.add_argument("--time-budget", type=float, default=100.0)
+    p_run.add_argument(
+        "--memory",
+        default=None,
+        help="Memory limit per bot for --sandbox/--docker (e.g. 200m, 200mb, 209715200)",
+    )
     p_run.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_run.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_run.add_argument(
@@ -68,6 +78,11 @@ Examples:
     p_qualify.add_argument("--rounds", type=int, default=10_000)
     p_qualify.add_argument("--seed", type=int, default=None)
     p_qualify.add_argument("--time-budget", type=float, default=100.0)
+    p_qualify.add_argument(
+        "--memory",
+        default=None,
+        help="Memory limit per bot for --sandbox/--docker (e.g. 200m, 200mb, 209715200)",
+    )
     p_qualify.add_argument("--sandbox", action="store_true", help="Run in sandboxed subprocess")
     p_qualify.add_argument("--docker",action="store_true", help="Run in Docker containers (full isolation, matches server)",)
     p_qualify.add_argument(

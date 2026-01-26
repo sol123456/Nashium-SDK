@@ -40,10 +40,15 @@ class SubprocessExecutor:
             time_limit: float = 100.0,
             seed: int | None = None,
             python_executable: str | None = None,
+            memory_limit_bytes: int | None = None,
     ):
         self._time_limit = time_limit
         self._elapsed_time = 0.0
         self._timed_out = False
+        self._memory_limit_bytes = memory_limit_bytes
+        self._memory_bytes_peak: int | None = None
+        self._memory_bytes_current: int | None = None
+        self._memory_exceeded = False
         self._closed = False
         self._python = python_executable or sys.executable
         self._process: subprocess.Popen | None = None
@@ -218,6 +223,9 @@ class SubprocessExecutor:
         if self._timed_out:
             return 0
 
+        if self._memory_exceeded:
+            return 0
+
         if self._closed:
             return 0
 
@@ -243,6 +251,8 @@ class SubprocessExecutor:
         elapsed = response.get("time", 0.0)
         self._elapsed_time += elapsed
 
+        self.poll_usage()
+
         if self._elapsed_time > self._time_limit:
             self._timed_out = True
 
@@ -252,6 +262,58 @@ class SubprocessExecutor:
             )
 
         return move
+
+    def _read_proc_status_value_bytes(self, key: str) -> int | None:
+        if self._process is None:
+            return None
+
+        status_path = Path("/proc") / str(self._process.pid) / "status"
+        if not status_path.exists():
+            return None
+
+        try:
+            content = status_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+
+        for line in content.splitlines():
+            if not line.startswith(key):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                return None
+            try:
+                value_kb = int(parts[1])
+            except ValueError:
+                return None
+            return value_kb * 1024
+
+        return None
+
+    def poll_usage(self) -> None:
+        if self._memory_exceeded:
+            return
+
+        current = self._read_proc_status_value_bytes("VmRSS:")
+        if current is not None:
+            self._memory_bytes_current = current
+
+        peak = self._read_proc_status_value_bytes("VmHWM:")
+        if peak is None:
+            peak = current
+        if peak is None:
+            return
+
+        if self._memory_bytes_peak is None or peak > self._memory_bytes_peak:
+            self._memory_bytes_peak = peak
+
+        if (
+                self._memory_limit_bytes is not None
+                and self._memory_bytes_peak is not None
+                and self._memory_bytes_peak > self._memory_limit_bytes
+        ):
+            self._memory_exceeded = True
+            self._kill_process()
 
     def reset(self) -> None:
         """Reset the bot state for a new match."""
@@ -274,6 +336,18 @@ class SubprocessExecutor:
     @property
     def timed_out(self) -> bool:
         return self._timed_out
+
+    @property
+    def memory_bytes_peak(self) -> int | None:
+        return self._memory_bytes_peak
+
+    @property
+    def memory_bytes_current(self) -> int | None:
+        return self._memory_bytes_current
+
+    @property
+    def memory_exceeded(self) -> bool:
+        return self._memory_exceeded
 
     def close(self) -> None:
         """Terminate the subprocess and clean up resources."""

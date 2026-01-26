@@ -72,6 +72,23 @@ def format_time_warning(max_time: float, budget: float = 100.0) -> str:
         return f"{Colors.RED}DANGER!{Colors.RESET} Your bot is very likely to timeout on the server ({max_time:.2f}s of {budget:.0f}s). Optimize before submitting!"
 
 
+def format_memory_warning(peak_bytes: int, budget_bytes: int) -> str:
+    ratio = (peak_bytes / budget_bytes) if budget_bytes else 0.0
+    peak_mb = peak_bytes / (1024 * 1024)
+    budget_mb = budget_bytes / (1024 * 1024)
+
+    if ratio < 0.25:
+        return f"{Colors.GREEN}Excellent!{Colors.RESET} Low memory usage ({peak_mb:.1f}MB of {budget_mb:.0f}MB limit)."
+    elif ratio < 0.50:
+        return f"{Colors.GREEN}Good.{Colors.RESET} Comfortable memory margin ({peak_mb:.1f}MB of {budget_mb:.0f}MB)."
+    elif ratio < 0.75:
+        return f"{Colors.YELLOW}Caution.{Colors.RESET} Significant memory usage ({peak_mb:.1f}MB of {budget_mb:.0f}MB)."
+    elif ratio < 0.90:
+        return f"{Colors.YELLOW}Warning!{Colors.RESET} Close to the memory limit ({peak_mb:.1f}MB of {budget_mb:.0f}MB)."
+    else:
+        return f"{Colors.RED}DANGER!{Colors.RESET} Very likely to run out of memory ({peak_mb:.1f}MB of {budget_mb:.0f}MB)."
+
+
 def format_result(result: "InteractionResult", stat_sig: bool, wins: int, rounds: int) -> tuple[str, str]:
     """Return (short_status, explanation)."""
     from ..core import InteractionResult
