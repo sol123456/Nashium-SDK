@@ -171,8 +171,8 @@ class _IsolatedBackend(Backend):
     Shared game loop for SandboxBackend and DockerBackend.
     """
 
-    def __init__(self, move_timeout: float = 5.0):
-        self._move_timeout = move_timeout
+    def __init__(self):
+        pass
 
     @abstractmethod
     def _create_executor(self, source: str, seed: int, config: MatchConfig):
@@ -334,7 +334,6 @@ class SandboxBackend(_IsolatedBackend):
         return SubprocessExecutor(
             source,
             time_limit=config.max_total_time_seconds_per_bot,
-            move_timeout=self._move_timeout,
             seed=seed,
         )
 
@@ -342,8 +341,8 @@ class SandboxBackend(_IsolatedBackend):
 class DockerBackend(_IsolatedBackend):
     """Docker container isolation (slow, full isolation)."""
 
-    def __init__(self, move_timeout: float = 5.0):
-        super().__init__(move_timeout)
+    def __init__(self):
+        super().__init__()
         self._validate_docker()
 
     def _validate_docker(self) -> None:
@@ -386,7 +385,6 @@ class DockerBackend(_IsolatedBackend):
         return DockerExecutor(
             source,
             time_limit=config.max_total_time_seconds_per_bot,
-            move_timeout=self._move_timeout,
             seed=seed,
         )
 
@@ -394,17 +392,15 @@ class DockerBackend(_IsolatedBackend):
 def get_backend(
     sandbox: bool = False,
     docker: bool = False,
-    move_timeout: float = 5.0,
 ) -> Backend:
     """Get the appropriate backend."""
 
     # Args:
     #     sandbox: Use subprocess isolation
     #     docker: Use Docker container isolation (overrides sandbox)
-    #     move_timeout: Timeout per move in seconds
 
     if docker:
-        return DockerBackend(move_timeout=move_timeout)
+        return DockerBackend()
     elif sandbox:
-        return SandboxBackend(move_timeout=move_timeout)
+        return SandboxBackend()
     return LocalBackend()

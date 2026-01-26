@@ -75,6 +75,7 @@ class MyBot:
             0 for Heads, 1 for Tails (your PREDICTION of what opponent will play)
         """
         # Round 0: No history yet, just guess
+        time.sleep(1000)
         if state.round_index == 0:
             return self.rng.choice([0, 1])
 

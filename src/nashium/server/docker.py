@@ -27,7 +27,6 @@ class DockerConfig:
     cpu_quota: int = 50000
     cpu_period: int = 100000
     pids_limit: int = 64
-    move_timeout: float = 5.0
 
 
 class DockerExecutor:
@@ -45,7 +44,6 @@ class DockerExecutor:
             self,
             bot_code: str,
             time_limit: float = 100.0,
-            move_timeout: float = 5.0,
             seed: int | None = None,
             config: DockerConfig | None = None,
             name: str = "Bot",
@@ -53,8 +51,16 @@ class DockerExecutor:
         if not DOCKER_AVAILABLE:
             raise RuntimeError("docker package required")
 
+        if not hasattr(socket, 'AF_UNIX'):
+            raise RuntimeError(
+                "Docker mode requires Unix sockets, which are not available on Windows.\n"
+                "Please run from WSL (Windows Subsystem for Linux):\n"
+                "  1. Install WSL: wsl --install\n"
+                "  2. Run your project from within WSL\n"
+                "  3. Docker Desktop should be configured to work with WSL"
+            )
+
         self._config = config or DockerConfig()
-        self._move_timeout = move_timeout
         self._time_limit = time_limit
         self._name = name
 
@@ -123,7 +129,8 @@ class DockerExecutor:
         self._server.settimeout(10.0)
         try:
             self._conn, _ = self._server.accept()
-            self._conn.settimeout(self._move_timeout)
+            #allows docker at least 10 seconds to load properly
+            self._conn.settimeout(10)
         except socket.timeout:
             print(" FAILED", flush=True)
             self._kill()
@@ -170,7 +177,6 @@ class DockerExecutor:
         return bytes(data)
 
     def get_move(self, opponent_last_move: int | None) -> int:
-        """Get bot's next move using binary protocol."""
         if self._timed_out or self._errored or self._closed:
             return 0
 
@@ -180,12 +186,16 @@ class DockerExecutor:
 
         opp = self.MOVE_NONE if opponent_last_move is None else opponent_last_move
 
-        # TIME ON HOST - untrusted code can't tamper with this
+        # Set socket timeout to remaining time (plus small buffer for IPC overhead)
+        remaining = self._time_limit - self._elapsed_time
+        self._conn.settimeout(remaining + 0.5)
+
         start = time.perf_counter()
 
         try:
             self._conn.sendall(bytes([self.CMD_MOVE, opp]))
         except Exception as e:
+            self._elapsed_time += time.perf_counter() - start
             self._errored = True
             self._error_message = f"Send failed: {e}"
             return 0
@@ -193,26 +203,28 @@ class DockerExecutor:
         try:
             resp = self._recvall(10)
         except socket.timeout:
+            self._elapsed_time += time.perf_counter() - start
             self._timed_out = True
             self._error_message = "Move timed out"
             return 0
         except Exception as e:
+            self._elapsed_time += time.perf_counter() - start
             self._errored = True
             self._error_message = f"Recv failed: {e}"
             return 0
 
-        # TIME ON HOST
         elapsed = time.perf_counter() - start
 
         if len(resp) < 10:
+            self._elapsed_time += elapsed
             self._errored = True
             self._error_message = "Incomplete response"
             return 0
 
         status, move = resp[0], resp[1]
-        # Ignore container-reported time (resp[2:10]) - can't be trusted
 
         if status != 0:
+            self._elapsed_time += elapsed
             self._errored = True
             self._error_message = f"Bot error (status={status})"
             return 0

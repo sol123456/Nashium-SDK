@@ -24,7 +24,6 @@ class SandboxConfig:
     network_enabled: bool = False
     time_limit: float = 100.0
     read_only_root: bool = True
-    move_timeout: float = 5.0
 
 
 class SubprocessExecutor:
@@ -39,12 +38,10 @@ class SubprocessExecutor:
             self,
             bot_code: str,
             time_limit: float = 100.0,
-            move_timeout: float = 5.0,
             seed: int | None = None,
             python_executable: str | None = None,
     ):
         self._time_limit = time_limit
-        self._move_timeout = move_timeout
         self._elapsed_time = 0.0
         self._timed_out = False
         self._closed = False
@@ -132,7 +129,8 @@ class SubprocessExecutor:
 
     def _recv(self, timeout: float | None = None) -> dict:
         """Receive JSON message from subprocess with timeout."""
-        timeout = timeout if timeout is not None else self._move_timeout
+        if timeout is None:
+            raise ValueError("_recv() requires an explicit timeout")
 
         try:
             status, data = self._response_queue.get(timeout=timeout)
