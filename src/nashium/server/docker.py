@@ -73,6 +73,8 @@ class DockerExecutor:
         self._start(bot_code, seed)
 
     def _start(self, bot_code: str, seed: int | None) -> None:
+        print(f"  [{self._name}] Starting container...", end="", flush=True)
+
         # Create Unix socket in temp directory
         self._sock_dir = tempfile.mkdtemp(prefix="nashium_")
         sock_path = os.path.join(self._sock_dir, "ipc.sock")
@@ -93,32 +95,48 @@ class DockerExecutor:
                 cpu_period=self._config.cpu_period,
                 pids_limit=self._config.pids_limit,
                 network_disabled=True,
-                read_only=True,  # Now safe since socket is in mounted volume
+                read_only=True,
                 security_opt=["no-new-privileges:true"],
                 cap_drop=["ALL"],
                 volumes={self._sock_dir: {"bind": "/ipc", "mode": "rw"}},
-                tmpfs={"/tmp": "size=10M,noexec,nosuid,nodev"},  # Add tmpfs for any temp needs
+                tmpfs={"/tmp": "size=10M,noexec,nosuid,nodev"},
                 remove=False,
-                user="1000:1000",  # Explicit non-root
+                user="1000:1000",
             )
         except docker.errors.ImageNotFound:
-            raise RuntimeError(f"Docker image '{self._config.image}' not found")
+            print(" FAILED", flush=True)
+            self._cleanup_socket()
+            raise RuntimeError(
+                f"Docker image '{self._config.image}' not found.\n"
+                f"Build with: docker build -t {self._config.image} src/nashium/server/"
+            )
         except Exception as e:
+            print(" FAILED", flush=True)
             self._cleanup_socket()
             raise RuntimeError(f"Failed to start container: {e}")
 
+        print(" started", flush=True)
+
         # Wait for container to connect
+        print(f"  [{self._name}] Loading bot...", end="", flush=True)
+
         self._server.settimeout(10.0)
         try:
             self._conn, _ = self._server.accept()
-            # self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._conn.settimeout(self._move_timeout)
         except socket.timeout:
+            print(" FAILED", flush=True)
             self._kill()
             raise RuntimeError("Container failed to connect")
 
-        # Load bot (JSON for this one-time operation)
-        self._send_load(bot_code, seed)
+        # Load bot
+        try:
+            self._send_load(bot_code, seed)
+            print(" ready ✓", flush=True)
+        except Exception as e:
+            print(" FAILED", flush=True)
+            self._kill()
+            raise
 
     def _send_load(self, code: str, seed: int | None) -> None:
         """Send load command with JSON, receive JSON response."""
