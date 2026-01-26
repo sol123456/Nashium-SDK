@@ -85,7 +85,7 @@ class DockerExecutor:
         try:
             self._container = self._client.containers.run(
                 image=self._config.image,
-                command=["python", "/app/fast_runner.py", "/ipc/ipc.sock"],
+                command=["python", "/app/_subprocess_runner.py", "/ipc/ipc.sock"],
                 detach=True,
                 mem_limit=self._config.memory_limit,
                 cpu_quota=self._config.cpu_quota,
@@ -108,7 +108,7 @@ class DockerExecutor:
         self._server.settimeout(10.0)
         try:
             self._conn, _ = self._server.accept()
-            self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._conn.settimeout(self._move_timeout)
         except socket.timeout:
             self._kill()

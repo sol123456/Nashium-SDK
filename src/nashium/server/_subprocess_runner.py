@@ -100,15 +100,24 @@ def send_response(sock: socket.socket, status: int, move: int, elapsed: float):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: fast_runner.py <socket_path>", file=sys.stderr)
+        print("Usage: _subprocess_runner.py <socket_path>", file=sys.stderr)
         sys.exit(1)
 
     sock_path = sys.argv[1]
 
     # Connect to host
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    # With:
+    for attempt in range(10):
+        try:
+            sock.connect(sock_path)
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            time.sleep(0.1)
+    else:
+        print(f"Failed to connect to {sock_path}", file=sys.stderr)
+        sys.exit(1)
+    # sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     runner: Runner | None = None
 
