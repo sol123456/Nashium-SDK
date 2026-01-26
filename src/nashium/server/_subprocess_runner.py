@@ -1,188 +1,160 @@
 #!/usr/bin/env python3
-"""
-Runner script for sandboxed bot execution.
-Communicates via JSON over stdin/stdout.
-Maintains game state internally to minimize IPC overhead.
-"""
+"""Ultra-fast runner with Unix socket + binary protocol."""
 from __future__ import annotations
 
 import json
+import socket
+import struct
 import sys
 import time
 import traceback
 import types
 from dataclasses import dataclass
 
+# Constants matching executor
+CMD_MOVE = 0
+CMD_QUIT = 1
+MOVE_NONE = 255
+
+STATUS_OK = 0
+STATUS_ERROR = 1
 
 
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RoundState:
-    """Game state passed to the bot."""
     round_index: int
     my_history: tuple[int, ...]
     opponent_history: tuple[int, ...]
 
-# Create fake nashium module so "from nashium import RoundState" works
-# This must happen before any bot code is executed
-_fake_nashium = types.ModuleType('nashium')
-_fake_nashium.RoundState = RoundState
-sys.modules['nashium'] = _fake_nashium
 
-# Also support "from nashium.core import RoundState"
-_fake_nashium_core = types.ModuleType('nashium.core')
-_fake_nashium_core.RoundState = RoundState
-sys.modules['nashium.core'] = _fake_nashium_core
-_fake_nashium.core = _fake_nashium_core
+# Fake module setup
+sys.modules['nashium'] = m = types.ModuleType('nashium')
+sys.modules['nashium.core'] = mc = types.ModuleType('nashium.core')
+m.RoundState = mc.RoundState = RoundState
+m.core = mc
 
 
-class BotRunner:
-    """Manages bot instance and game state."""
+class Runner:
+    __slots__ = ('bot', 'my', 'opp', 'idx')
 
     def __init__(self, bot):
         self.bot = bot
-        self.my_history: list[int] = []
-        self.opponent_history: list[int] = []
-        self.round_index: int = 0
+        self.my: list[int] = []
+        self.opp: list[int] = []
+        self.idx = 0
 
-    def reset(self) -> None:
-        """Reset state for a new match."""
-        self.my_history.clear()
-        self.opponent_history.clear()
-        self.round_index = 0
+    def move(self, opp_last: int | None) -> tuple[int, float]:
+        if opp_last is not None:
+            self.opp.append(opp_last)
 
-    def make_move(self, opponent_last_move: int | None) -> tuple[int, float]:
-        """
-        Process opponent's last move and generate our move.
-        Returns (move, time_taken).
-        """
-        if opponent_last_move is not None:
-            self.opponent_history.append(opponent_last_move)
+        state = RoundState(self.idx, tuple(self.my), tuple(self.opp))
 
-        state = RoundState(
-            round_index=self.round_index,
-            my_history=tuple(self.my_history),
-            opponent_history=tuple(self.opponent_history),
-        )
+        t0 = time.perf_counter()
+        mv = int(self.bot.move(state))
+        elapsed = time.perf_counter() - t0
 
-        start = time.perf_counter()
-        move = int(self.bot.move(state))
-        elapsed = time.perf_counter() - start
-
-        self.my_history.append(move)
-        self.round_index += 1
-
-        return move, elapsed
-
-
-def send(data: dict) -> None:
-    """Send JSON response to stdout."""
-    print(json.dumps(data), flush=True)
-
-
-def recv() -> dict | None:
-    """Read JSON command from stdin."""
-    try:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        return json.loads(line.strip())
-    except Exception as e:
-        send({"status": "error", "error": f"Failed to read input: {e}"})
-        return None
+        self.my.append(mv)
+        self.idx += 1
+        return mv, elapsed
 
 
 def load_bot(code: str, seed: int | None = None):
-    """
-    Load and instantiate a bot from source code.
+    ns = {"__name__": "__bot__", "RoundState": RoundState}
+    exec(compile(code, "<bot>", "exec"), ns)
 
-    If seed is provided and the Bot class accepts a seed parameter,
-    it will be passed to the constructor.
-    """
-    namespace = {"__name__": "__bot__"}
-    namespace["RoundState"] = RoundState
-
-    exec(compile(code, "<bot>", "exec"), namespace)
-
-    bot_class = namespace.get("Bot")
-
-    if bot_class is None:
-        for name, obj in namespace.items():
-            if (
-                    isinstance(obj, type)
-                    and callable(getattr(obj, "move", None))
-                    and name != "RoundState"
-            ):
-                bot_class = obj
+    cls = ns.get("Bot")
+    if cls is None:
+        for v in ns.values():
+            if isinstance(v, type) and callable(getattr(v, "move", None)):
+                cls = v
                 break
 
-    if bot_class is None:
-        raise ValueError(
-            "No Bot class found. Define a class named 'Bot' with a 'move' method."
-        )
+    if cls is None:
+        raise ValueError("No Bot class found")
 
-    # Try to instantiate with seed, fall back to no args
     if seed is not None:
         try:
-            return bot_class(seed=seed)
+            return cls(seed=seed)
         except TypeError:
             try:
-                return bot_class(seed)
+                return cls(seed)
             except TypeError:
                 pass
+    return cls()
 
-    return bot_class()
+
+def recvall(sock: socket.socket, n: int) -> bytes:
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def send_response(sock: socket.socket, status: int, move: int, elapsed: float):
+    """Send binary response: status(1) + move(1) + time(8)"""
+    sock.sendall(bytes([status, move]) + struct.pack(">d", elapsed))
 
 
 def main():
-    runner: BotRunner | None = None
+    if len(sys.argv) < 2:
+        print("Usage: fast_runner.py <socket_path>", file=sys.stderr)
+        sys.exit(1)
 
-    while True:
-        cmd = recv()
-        if cmd is None:
-            break
+    sock_path = sys.argv[1]
 
-        command = cmd.get("cmd")
+    # Connect to host
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        if command == "quit":
-            break
+    runner: Runner | None = None
 
-        elif command == "load":
-            try:
-                seed = cmd.get("seed")  # Optional seed
-                bot = load_bot(cmd["code"], seed=seed)
-                runner = BotRunner(bot)
-                send({"status": "ok"})
-            except Exception as e:
-                send({
-                    "status": "error",
-                    "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-                })
-
-        elif command == "reset":
+    try:
+        while True:
+            # First, check for load command (length-prefixed JSON)
             if runner is None:
-                send({"status": "error", "error": "Bot not loaded"})
-            else:
-                runner.reset()
-                send({"status": "ok"})
+                raw_len = recvall(sock, 4)
+                length = struct.unpack(">I", raw_len)[0]
+                data = recvall(sock, length)
+                cmd = json.loads(data)
 
-        elif command == "move":
-            if runner is None:
-                send({"status": "error", "error": "Bot not loaded"})
+                if cmd.get("cmd") == "load":
+                    try:
+                        bot = load_bot(cmd["code"], cmd.get("seed"))
+                        runner = Runner(bot)
+                        resp = json.dumps({"status": "ok"}).encode()
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        resp = json.dumps({
+                            "status": "error",
+                            "error": f"{type(e).__name__}: {e}\n{tb}"
+                        }).encode()
+
+                    sock.sendall(struct.pack(">I", len(resp)) + resp)
                 continue
 
-            try:
-                opponent_last = cmd.get("opponent_last")
-                move, elapsed = runner.make_move(opponent_last)
-                send({"status": "ok", "move": move, "time": elapsed})
-            except Exception as e:
-                send({
-                    "status": "error",
-                    "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-                })
+            # Binary protocol for moves: cmd(1) + opp_move(1)
+            header = recvall(sock, 2)
+            cmd_byte, opp_byte = header[0], header[1]
 
-        else:
-            send({"status": "error", "error": f"Unknown command: {command}"})
+            if cmd_byte == CMD_QUIT:
+                break
+
+            if cmd_byte == CMD_MOVE:
+                opp_last = None if opp_byte == MOVE_NONE else opp_byte
+                try:
+                    mv, elapsed = runner.move(opp_last)
+                    send_response(sock, STATUS_OK, mv, elapsed)
+                except Exception as e:
+                    send_response(sock, STATUS_ERROR, 0, 0.0)
+
+    except ConnectionError:
+        pass
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":

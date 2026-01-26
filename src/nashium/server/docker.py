@@ -1,15 +1,19 @@
+# fast_executor.py
 from __future__ import annotations
 
 import json
-import queue
-import threading
+import os
+import socket
+import struct
+import tempfile
+import shutil
 from dataclasses import dataclass
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
 
 try:
     import docker
-    from docker.models.containers import Container
+
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False
@@ -17,7 +21,6 @@ except ImportError:
 
 @dataclass
 class DockerConfig:
-    """Configuration for Docker execution."""
     image: str = "nashium-runner:latest"
     memory_limit: str = "256m"
     cpu_quota: int = 50000
@@ -28,8 +31,14 @@ class DockerConfig:
 
 class DockerExecutor:
     """
-    Executes a bot in an isolated Docker container.
+    Fast executor using Unix socket with binary protocol.
+    Eliminates Docker stream demux, JSON per-move, and threading overhead.
     """
+
+    # Binary protocol constants
+    CMD_MOVE = 0
+    CMD_QUIT = 1
+    MOVE_NONE = 255
 
     def __init__(
             self,
@@ -41,232 +50,106 @@ class DockerExecutor:
             name: str = "Bot",
     ):
         if not DOCKER_AVAILABLE:
-            raise RuntimeError(
-                "DockerExecutor requires 'docker' package. "
-                "Install with: pip install docker"
-            )
+            raise RuntimeError("docker package required")
 
         self._config = config or DockerConfig()
-        self._config = DockerConfig(
-            image=self._config.image,
-            memory_limit=self._config.memory_limit,
-            cpu_quota=self._config.cpu_quota,
-            cpu_period=self._config.cpu_period,
-            pids_limit=self._config.pids_limit,
-            move_timeout=move_timeout,
-        )
-
-        self._bot_code = bot_code
-        self._seed = seed
+        self._move_timeout = move_timeout
         self._time_limit = time_limit
+        self._name = name
+
         self._elapsed_time = 0.0
         self._timed_out = False
         self._errored = False
         self._error_message: str | None = None
         self._closed = False
-        self._name = name
 
         self._client = docker.from_env()
-        self._container: Container | None = None
-        self._socket = None
-        self._raw_socket = None
+        self._container = None
+        self._sock_dir: str | None = None
+        self._server: socket.socket | None = None
+        self._conn: socket.socket | None = None
 
-        self._response_queue: queue.Queue = queue.Queue()
-        self._reader_thread: threading.Thread | None = None
-        self._stop_reader = threading.Event()
+        self._start(bot_code, seed)
 
-        self._start_container()
+    def _start(self, bot_code: str, seed: int | None) -> None:
+        # Create Unix socket in temp directory
+        self._sock_dir = tempfile.mkdtemp(prefix="nashium_")
+        sock_path = os.path.join(self._sock_dir, "ipc.sock")
 
-    def _get_raw_socket(self, socket):
-        """Get the raw socket, handling platform differences."""
-        if hasattr(socket, '_sock'):
-            return socket._sock
-        return socket
-
-    def _start_container(self) -> None:
-        """Start Docker container and load bot."""
-        print(f"  [{self._name}] Starting container...", end="", flush=True)
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(sock_path)
+        self._server.listen(1)
+        os.chmod(sock_path, 0o777)
 
         try:
             self._container = self._client.containers.run(
                 image=self._config.image,
+                command=["python", "/app/fast_runner.py", "/ipc/ipc.sock"],
                 detach=True,
-                stdin_open=True,
                 mem_limit=self._config.memory_limit,
                 cpu_quota=self._config.cpu_quota,
                 cpu_period=self._config.cpu_period,
                 pids_limit=self._config.pids_limit,
                 network_disabled=True,
-                read_only=True,
+                read_only=False,  # Need write for socket
                 security_opt=["no-new-privileges:true"],
                 cap_drop=["ALL"],
+                volumes={self._sock_dir: {"bind": "/ipc", "mode": "rw"}},
                 remove=False,
             )
         except docker.errors.ImageNotFound:
-            print(" FAILED", flush=True)
-            raise RuntimeError(
-                f"Docker image '{self._config.image}' not found.\n"
-                f"Build with: docker build -t {self._config.image} src/nashium/server/"
-            )
-        except docker.errors.APIError as e:
-            print(" FAILED", flush=True)
-            raise RuntimeError(f"Docker API error: {e}")
+            raise RuntimeError(f"Docker image '{self._config.image}' not found")
         except Exception as e:
-            print(" FAILED", flush=True)
+            self._cleanup_socket()
             raise RuntimeError(f"Failed to start container: {e}")
 
-        print(" started", flush=True)
-
-        # Attach socket
-        self._socket = self._container.attach_socket(
-            params={"stdout": 1, "stderr": 1, "stdin": 1, "stream": 1}
-        )
-        self._raw_socket = self._get_raw_socket(self._socket)
-
-        self._start_reader_thread()
-
-        # Load bot code
-        print(f"  [{self._name}] Loading bot...", end="", flush=True)
-
-        load_cmd = {"cmd": "load", "code": self._bot_code}
-        if self._seed is not None:
-            load_cmd["seed"] = self._seed
-
-        self._send(load_cmd)
-        response = self._recv(timeout=10.0)
-
-        if response.get("status") != "ok":
-            print(" FAILED", flush=True)
-            error_msg = response.get("error", "Failed to load bot")
-            self.close()
-            raise BotLoadError(error_msg)
-
-        print(" ready ✓", flush=True)
-
-    def _start_reader_thread(self) -> None:
-        """Background thread that reads and demultiplexes container output."""
-        def reader_loop():
-            raw_buffer = b""
-            content_buffer = b""
-
-            while not self._stop_reader.is_set():
-                try:
-                    chunk = self._raw_socket.recv(4096)
-                    if not chunk:
-                        self._response_queue.put(("eof", None))
-                        break
-
-                    raw_buffer += chunk
-
-                    while len(raw_buffer) >= 8:
-                        stream_type = raw_buffer[0]
-                        padding = raw_buffer[1:4]
-
-                        if stream_type in (1, 2) and padding == b"\x00\x00\x00":
-                            payload_size = int.from_bytes(raw_buffer[4:8], 'big')
-                            frame_size = 8 + payload_size
-
-                            if len(raw_buffer) < frame_size:
-                                break
-
-                            content_buffer += raw_buffer[8:frame_size]
-                            raw_buffer = raw_buffer[frame_size:]
-                        else:
-                            content_buffer += raw_buffer[:1]
-                            raw_buffer = raw_buffer[1:]
-
-                    while b"\n" in content_buffer:
-                        line, content_buffer = content_buffer.split(b"\n", 1)
-                        decoded = line.decode("utf-8").strip()
-                        if decoded:
-                            self._response_queue.put(("ok", decoded))
-
-                except Exception as e:
-                    if not self._stop_reader.is_set():
-                        self._response_queue.put(("error", str(e)))
-                    break
-
-        self._reader_thread = threading.Thread(target=reader_loop, daemon=True)
-        self._reader_thread.start()
-
-    def _send(self, data: dict) -> None:
-        """Send JSON command to container."""
-        if self._raw_socket is None:
-            raise BotRuntimeError("Container not running", RuntimeError())
-
+        # Wait for container to connect
+        self._server.settimeout(10.0)
         try:
-            line = json.dumps(data) + "\n"
-            self._raw_socket.send(line.encode())
-        except Exception as e:
-            self._kill_container()
-            raise BotRuntimeError("Failed to send to container", e)
+            self._conn, _ = self._server.accept()
+            self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._conn.settimeout(self._move_timeout)
+        except socket.timeout:
+            self._kill()
+            raise RuntimeError("Container failed to connect")
 
-    def _recv(self, timeout: float | None = None) -> dict:
-        """Receive JSON response from container."""
-        timeout = timeout if timeout is not None else self._config.move_timeout
+        # Load bot (JSON for this one-time operation)
+        self._send_load(bot_code, seed)
 
-        try:
-            status, data = self._response_queue.get(timeout=timeout)
-        except queue.Empty:
-            self._kill_container()
-            raise BotRuntimeError(
-                f"Move timed out after {timeout}s - container killed",
-                TimeoutError()
-            )
+    def _send_load(self, code: str, seed: int | None) -> None:
+        """Send load command with JSON, receive JSON response."""
+        msg = {"cmd": "load", "code": code}
+        if seed is not None:
+            msg["seed"] = seed
 
-        if status == "eof":
-            logs = self._get_logs()
-            self._kill_container()
-            raise BotRuntimeError(f"Container terminated. Logs: {logs}", RuntimeError())
+        data = json.dumps(msg).encode()
+        self._conn.sendall(struct.pack(">I", len(data)) + data)
 
-        if status == "error":
-            self._kill_container()
-            raise BotRuntimeError(f"Read error: {data}", RuntimeError())
+        # Receive response
+        raw_len = self._recvall(4)
+        if not raw_len:
+            raise BotLoadError("Connection closed during load")
 
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError as e:
-            raise BotRuntimeError(f"Invalid JSON: {data!r}", e)
+        length = struct.unpack(">I", raw_len)[0]
+        resp_data = self._recvall(length)
+        resp = json.loads(resp_data)
 
-    def _get_logs(self) -> str:
-        """Get container logs for debugging."""
-        if self._container is None:
-            return ""
-        try:
-            return self._container.logs(tail=50).decode()
-        except:
-            return ""
+        if resp.get("status") != "ok":
+            raise BotLoadError(resp.get("error", "Load failed"))
 
-    def _kill_container(self) -> None:
-        """Stop and remove container."""
-        if self._container is None:
-            return
-
-        self._stop_reader.set()
-
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except:
-                pass
-
-        try:
-            self._container.stop(timeout=1)
-        except:
-            pass
-
-        try:
-            self._container.kill()
-        except:
-            pass
-
-        try:
-            self._container.remove(force=True)
-        except:
-            pass
+    def _recvall(self, n: int) -> bytes:
+        """Receive exactly n bytes."""
+        data = bytearray()
+        while len(data) < n:
+            chunk = self._conn.recv(n - len(data))
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+        return bytes(data)
 
     def get_move(self, opponent_last_move: int | None) -> int:
-        """Get bot's next move."""
+        """Get bot's next move using binary protocol."""
         if self._timed_out or self._errored or self._closed:
             return 0
 
@@ -274,28 +157,40 @@ class DockerExecutor:
             self._timed_out = True
             return 0
 
-        msg = {"cmd": "move"}
-        if opponent_last_move is not None:
-            msg["opponent_last"] = opponent_last_move
-
+        # Send: 1 byte cmd + 1 byte opponent_move
+        opp = self.MOVE_NONE if opponent_last_move is None else opponent_last_move
         try:
-            self._send(msg)
-            response = self._recv()
-        except BotRuntimeError as e:
-            if isinstance(e.__cause__, TimeoutError):
-                self._timed_out = True
-            else:
-                self._errored = True
-                self._error_message = str(e)
-            return 0
-
-        if response.get("status") == "error":
+            self._conn.sendall(bytes([self.CMD_MOVE, opp]))
+        except Exception as e:
             self._errored = True
-            self._error_message = response.get("error", "Unknown error")
+            self._error_message = f"Send failed: {e}"
             return 0
 
-        move = response.get("move", 0)
-        elapsed = response.get("time", 0.0)
+        # Receive: 1 byte status + 1 byte move + 8 bytes time (double)
+        try:
+            resp = self._recvall(10)
+        except socket.timeout:
+            self._timed_out = True
+            self._error_message = "Move timed out"
+            return 0
+        except Exception as e:
+            self._errored = True
+            self._error_message = f"Recv failed: {e}"
+            return 0
+
+        if len(resp) < 10:
+            self._errored = True
+            self._error_message = "Incomplete response"
+            return 0
+
+        status, move = resp[0], resp[1]
+        elapsed = struct.unpack(">d", resp[2:10])[0]
+
+        if status != 0:
+            self._errored = True
+            self._error_message = f"Bot error (status={status})"
+            return 0
+
         self._elapsed_time += elapsed
 
         if self._elapsed_time > self._time_limit:
@@ -305,6 +200,35 @@ class DockerExecutor:
             raise InvalidMoveError(f"Invalid move: {move}")
 
         return move
+
+    def _cleanup_socket(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except:
+                pass
+        if self._server:
+            try:
+                self._server.close()
+            except:
+                pass
+        if self._sock_dir and os.path.exists(self._sock_dir):
+            try:
+                shutil.rmtree(self._sock_dir)
+            except:
+                pass
+
+    def _kill(self) -> None:
+        self._cleanup_socket()
+        if self._container:
+            try:
+                self._container.kill()
+            except:
+                pass
+            try:
+                self._container.remove(force=True)
+            except:
+                pass
 
     @property
     def elapsed_time(self) -> float:
@@ -323,22 +247,20 @@ class DockerExecutor:
         return self._error_message
 
     def close(self) -> None:
-        """Clean up container."""
         if self._closed:
             return
-
         self._closed = True
 
-        if self._container:
+        if self._conn:
             try:
-                self._send({"cmd": "quit"})
+                self._conn.sendall(bytes([self.CMD_QUIT, 0]))
             except:
                 pass
 
-        self._kill_container()
+        self._kill()
 
-    def __enter__(self) -> "DockerExecutor":
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, *_):
         self.close()

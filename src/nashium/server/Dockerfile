@@ -1,15 +1,10 @@
 FROM python:3.11-slim
 
-# Create non-root user
-RUN useradd -m -u 1000 runner
-
 WORKDIR /app
+COPY _subprocess_runner.py /app/
 
-# Copy the runner script (the contract between executor and container)
-COPY _subprocess_runner.py /app/runner.py
-
-# Switch to non-root user for security
+# Run as non-root
+RUN useradd -m -u 1000 runner
 USER runner
 
-# Run the runner script
-CMD ["python", "-u", "/app/runner.py"]
+CMD ["python", "/app/_subprocess_runner.py"]
