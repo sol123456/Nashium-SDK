@@ -86,7 +86,7 @@ class SubprocessExecutor:
             load_cmd["seed"] = self._seed
 
         self._send(load_cmd)
-        response = self._recv(timeout=10.0)
+        response = self._recv()
 
         if response.get("status") != "ok":
             error_msg = response.get("error", "Failed to load bot")
@@ -127,10 +127,9 @@ class SubprocessExecutor:
             self._kill_process()
             raise BotRuntimeError("Process terminated unexpectedly", e)
 
-    def _recv(self, timeout: float | None = None) -> dict:
-        """Receive JSON message from subprocess with timeout."""
-        if timeout is None:
-            raise ValueError("_recv() requires an explicit timeout")
+    def _recv(self) -> dict:
+        # 3 seconds for the bots to load, not related to cpu timeouts
+        timeout = 3
 
         try:
             status, data = self._response_queue.get(timeout=timeout)
@@ -261,7 +260,7 @@ class SubprocessExecutor:
 
         try:
             self._send({"cmd": "reset"})
-            self._recv(timeout=1.0)
+            self._recv()
         except:
             pass
 

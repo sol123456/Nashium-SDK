@@ -23,7 +23,7 @@ except ImportError:
 @dataclass
 class DockerConfig:
     image: str = "nashium-runner:latest"
-    memory_limit: str = "256m"
+    memory_limit: str = "200m"
     cpu_quota: int = 50000
     cpu_period: int = 100000
     pids_limit: int = 64
