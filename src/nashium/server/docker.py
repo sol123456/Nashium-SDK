@@ -7,6 +7,7 @@ import socket
 import struct
 import tempfile
 import shutil
+import time
 from dataclasses import dataclass
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
@@ -92,11 +93,13 @@ class DockerExecutor:
                 cpu_period=self._config.cpu_period,
                 pids_limit=self._config.pids_limit,
                 network_disabled=True,
-                read_only=False,  # Need write for socket
+                read_only=True,  # Now safe since socket is in mounted volume
                 security_opt=["no-new-privileges:true"],
                 cap_drop=["ALL"],
                 volumes={self._sock_dir: {"bind": "/ipc", "mode": "rw"}},
+                tmpfs={"/tmp": "size=10M,noexec,nosuid,nodev"},  # Add tmpfs for any temp needs
                 remove=False,
+                user="1000:1000",  # Explicit non-root
             )
         except docker.errors.ImageNotFound:
             raise RuntimeError(f"Docker image '{self._config.image}' not found")
@@ -157,8 +160,11 @@ class DockerExecutor:
             self._timed_out = True
             return 0
 
-        # Send: 1 byte cmd + 1 byte opponent_move
         opp = self.MOVE_NONE if opponent_last_move is None else opponent_last_move
+
+        # TIME ON HOST - untrusted code can't tamper with this
+        start = time.perf_counter()
+
         try:
             self._conn.sendall(bytes([self.CMD_MOVE, opp]))
         except Exception as e:
@@ -166,7 +172,6 @@ class DockerExecutor:
             self._error_message = f"Send failed: {e}"
             return 0
 
-        # Receive: 1 byte status + 1 byte move + 8 bytes time (double)
         try:
             resp = self._recvall(10)
         except socket.timeout:
@@ -178,13 +183,16 @@ class DockerExecutor:
             self._error_message = f"Recv failed: {e}"
             return 0
 
+        # TIME ON HOST
+        elapsed = time.perf_counter() - start
+
         if len(resp) < 10:
             self._errored = True
             self._error_message = "Incomplete response"
             return 0
 
         status, move = resp[0], resp[1]
-        elapsed = struct.unpack(">d", resp[2:10])[0]
+        # Ignore container-reported time (resp[2:10]) - can't be trusted
 
         if status != 0:
             self._errored = True
