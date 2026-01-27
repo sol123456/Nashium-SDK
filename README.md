@@ -143,26 +143,19 @@ Filenames include bot names and seed, for example:
 
 The following options are shared by **check**, **run**, and **qualify**:
 
-- `--rounds <int>`
-  Number of rounds per match.
-  Default: `10_000`.
+- `--rounds <int>` Number of rounds per match. Default: `10_000`.
 
-- `--seed <int>`  
-  Use a specific random seed for reproducibility.
+- `--seed <int>` Use a specific random seed for reproducibility.
 
-- `--time-budget <float>`  
-  Total time limit in seconds.  
-  Default (and server value): **100.0 seconds**
+- `--time-budget <float>` Total time limit in seconds. Default (and server value): **100.0 seconds**
 
-- `--memory <value>`
-  Memory limit per bot for `--sandbox`/`--docker` (e.g. `200m`, `200mb`, `209715200`).
-  Default (sandbox/docker): **200MB**.
+- `--memory <value>` Memory limit per bot for `--sandbox`/`--docker` (e.g. `200m`, `200mb`, `209715200`). Default (sandbox/docker): **200MB**.
 
-- `--sandbox`
-  Run each bot in a separate subprocess.
+- `--sandbox` Run each bot in a separate subprocess. This is slower with worse error logging, but can handle hanging code.
 
-- `--docker`
-  Run each bot in a Docker container (matches the server environment).
+- `--docker` Run each bot in a Docker container (matches the server environment). 
+  - Requires linux environment and running docker container. 
+  - Configure with `cd src/nashium/server` then `docker build -t nashium-runner:latest .`
 
 ---
 

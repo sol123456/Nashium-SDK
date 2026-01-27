@@ -361,12 +361,14 @@ def cmd_qualify(args: argparse.Namespace) -> int:
 
     if docker:
         print_success("✓ Docker backend active")
-        print_dim("  Running in isolated containers (matches server environment)")
+        print_dim("  Running in isolated containers (matches server environment) -- this will drastically increase run time")
     elif sandbox:
-        print_dim(f"Execution mode: {mode_str}")
+        print_dim(f"Execution mode: {mode_str} -- this will drastically increase run time")
     else:
         print_warning("RAM usage is not measured in local mode (both bots share one Python process).")
         print_dim("Use --sandbox for host-measured RAM usage and enforcement.")
+
+    print_warning("Qualify may take 20-30 minutes on complex bots. Use nashium run command for quick testing against another bot.")
 
     # Determine seed
     if args.seed is not None:
@@ -653,12 +655,14 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     if docker:
         print_success("✓ Docker backend active")
-        print_dim("  Running in isolated containers (matches server environment)")
+        print_dim("  Running in isolated containers (matches server environment) -- this will drastically increase run time")
     elif sandbox:
-        print_dim(f"Execution mode: {mode_str}")
+        print_dim(f"Execution mode: {mode_str} -- this will drastically increase run time")
     else:
         print_warning("RAM usage is not measured in local mode (both bots share one Python process).")
         print_dim("Use --sandbox for host-measured RAM usage and enforcement.")
+
+    print_warning("Check command may take 20-30 minutes on complex bots. Use nashium run command for quick testing against another bot.")
 
     # Determine seed
     if args.seed is not None:

@@ -1,4 +1,4 @@
-# fast_executor.py
+# docker.py
 from __future__ import annotations
 
 import json
@@ -7,8 +7,10 @@ import socket
 import struct
 import tempfile
 import shutil
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
 
@@ -29,10 +31,168 @@ class DockerConfig:
     pids_limit: int = 64
 
 
+@dataclass(frozen=True, slots=True)
+class StatsSample:
+    """A single stats sample for recording."""
+    timestamp: float
+    memory_bytes: int
+    memory_peak_bytes: int
+    cpu_percent: float
+
+
+class BackgroundStatsMonitor:
+    """
+    Non-blocking stats monitor using Docker's streaming API.
+    Runs in a background thread, collecting samples continuously.
+    """
+
+    def __init__(self, container, sample_interval: float = 0.5):
+        self._container = container
+        self._sample_interval = sample_interval
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+        self._memory_current: int = 0
+        self._memory_peak: int = 0
+        self._cpu_percent: float = 0.0
+        self._samples: List[StatsSample] = []
+        self._start_time: float = time.time()
+        self._last_sample_time: float = 0.0
+
+    def start(self) -> None:
+        """Start the background monitoring thread."""
+        self._running = True
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the background monitoring thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _monitor_loop(self) -> None:
+        """Main monitoring loop - uses streaming API for efficiency."""
+        try:
+            # Use streaming API - single connection, continuous updates
+            # This is MUCH faster than calling stats(stream=False) repeatedly
+            for stats in self._container.stats(stream=True, decode=True):
+                if not self._running:
+                    break
+
+                now = time.time()
+
+                # Rate-limit sample storage to avoid memory bloat
+                # (Docker streams stats roughly every 1 second anyway)
+                should_store = (now - self._last_sample_time) >= self._sample_interval
+
+                # Parse memory stats
+                mem = stats.get("memory_stats", {})
+                mem_current = mem.get("usage", 0)
+                mem_peak = mem.get("max_usage") or mem_current
+
+                # Parse CPU stats and calculate percentage
+                cpu_pct = self._calculate_cpu_percent(stats)
+
+                with self._lock:
+                    self._memory_current = mem_current
+                    self._memory_peak = max(self._memory_peak, mem_peak)
+                    self._cpu_percent = cpu_pct
+
+                    if should_store:
+                        self._samples.append(StatsSample(
+                            timestamp=now - self._start_time,
+                            memory_bytes=mem_current,
+                            memory_peak_bytes=self._memory_peak,
+                            cpu_percent=cpu_pct,
+                        ))
+                        self._last_sample_time = now
+
+        except Exception:
+            # Container stopped or connection lost - this is expected
+            pass
+
+    def _calculate_cpu_percent(self, stats: dict) -> float:
+        """Calculate CPU percentage from Docker stats."""
+        try:
+            cpu = stats.get("cpu_stats", {})
+            precpu = stats.get("precpu_stats", {})
+
+            cpu_usage = cpu.get("cpu_usage", {})
+            precpu_usage = precpu.get("cpu_usage", {})
+
+            cpu_total = cpu_usage.get("total_usage", 0)
+            precpu_total = precpu_usage.get("total_usage", 0)
+            cpu_delta = cpu_total - precpu_total
+
+            sys_delta = (
+                    cpu.get("system_cpu_usage", 0) -
+                    precpu.get("system_cpu_usage", 0)
+            )
+
+            if sys_delta > 0 and cpu_delta > 0:
+                # Get number of CPUs
+                percpu = cpu_usage.get("percpu_usage")
+                n_cpus = len(percpu) if percpu else 1
+                return (cpu_delta / sys_delta) * n_cpus * 100.0
+
+        except (KeyError, TypeError, ZeroDivisionError):
+            pass
+
+        return 0.0
+
+    @property
+    def memory_current(self) -> int:
+        """Current memory usage in bytes."""
+        with self._lock:
+            return self._memory_current
+
+    @property
+    def memory_peak(self) -> int:
+        """Peak memory usage in bytes."""
+        with self._lock:
+            return self._memory_peak
+
+    @property
+    def cpu_percent(self) -> float:
+        """Current CPU usage percentage."""
+        with self._lock:
+            return self._cpu_percent
+
+    def get_samples(self) -> List[StatsSample]:
+        """Get a copy of all recorded samples."""
+        with self._lock:
+            return list(self._samples)
+
+    def get_summary(self) -> dict:
+        """Get a summary of resource usage."""
+        with self._lock:
+            if not self._samples:
+                return {
+                    "memory_peak_bytes": self._memory_peak,
+                    "memory_peak_mb": self._memory_peak / (1024 * 1024),
+                    "cpu_avg_percent": 0.0,
+                    "cpu_max_percent": 0.0,
+                    "sample_count": 0,
+                }
+
+            cpu_values = [s.cpu_percent for s in self._samples]
+            return {
+                "memory_peak_bytes": self._memory_peak,
+                "memory_peak_mb": self._memory_peak / (1024 * 1024),
+                "cpu_avg_percent": sum(cpu_values) / len(cpu_values),
+                "cpu_max_percent": max(cpu_values),
+                "sample_count": len(self._samples),
+            }
+
+
 class DockerExecutor:
     """
     Fast executor using Unix socket with binary protocol.
-    Eliminates Docker stream demux, JSON per-move, and threading overhead.
+    Includes non-blocking background resource monitoring.
     """
 
     # Binary protocol constants
@@ -47,6 +207,8 @@ class DockerExecutor:
             seed: int | None = None,
             config: DockerConfig | None = None,
             name: str = "Bot",
+            enable_stats: bool = True,
+            stats_sample_interval: float = 0.5,
     ):
         if not DOCKER_AVAILABLE:
             raise RuntimeError("docker package required")
@@ -63,6 +225,8 @@ class DockerExecutor:
         self._config = config or DockerConfig()
         self._time_limit = time_limit
         self._name = name
+        self._enable_stats = enable_stats
+        self._stats_sample_interval = stats_sample_interval
 
         self._elapsed_time = 0.0
         self._timed_out = False
@@ -78,6 +242,7 @@ class DockerExecutor:
         self._sock_dir: str | None = None
         self._server: socket.socket | None = None
         self._conn: socket.socket | None = None
+        self._stats_monitor: BackgroundStatsMonitor | None = None
 
         self._start(bot_code, seed)
 
@@ -112,24 +277,11 @@ class DockerExecutor:
         return None
 
     def poll_usage(self) -> None:
-        if self._container is None:
-            return
-
-        try:
-            stats = self._container.stats(stream=False)
-        except Exception:
-            return
-
-        mem_stats = stats.get("memory_stats") or {}
-        current = mem_stats.get("usage")
-        if isinstance(current, int):
-            self._memory_bytes_current = current
-        peak = mem_stats.get("max_usage")
-        if peak is None:
-            peak = current
-        if isinstance(peak, int):
-            if self._memory_bytes_peak is None or peak > self._memory_bytes_peak:
-                self._memory_bytes_peak = peak
+        """
+        Legacy method - now a no-op since monitoring happens in background.
+        Kept for API compatibility.
+        """
+        pass
 
     def _start(self, bot_code: str, seed: int | None) -> None:
         print(f"  [{self._name}] Starting container...", end="", flush=True)
@@ -176,13 +328,21 @@ class DockerExecutor:
 
         print(" started", flush=True)
 
+        # Start background stats monitoring (non-blocking)
+        if self._enable_stats:
+            self._stats_monitor = BackgroundStatsMonitor(
+                self._container,
+                sample_interval=self._stats_sample_interval
+            )
+            self._stats_monitor.start()
+
         # Wait for container to connect
         print(f"  [{self._name}] Loading bot...", end="", flush=True)
 
         self._server.settimeout(10.0)
         try:
             self._conn, _ = self._server.accept()
-            #allows docker at least 10 seconds to load properly
+            # allows docker at least 10 seconds to load properly
             self._conn.settimeout(10)
         except socket.timeout:
             print(" FAILED", flush=True)
@@ -306,7 +466,6 @@ class DockerExecutor:
                 self._memory_exceeded = True
                 self._errored = False
                 self._error_message = "Container was OOM-killed"
-                self.poll_usage()
         except Exception:
             return
 
@@ -328,7 +487,13 @@ class DockerExecutor:
                 pass
 
     def _kill(self) -> None:
+        # Stop stats monitor first
+        if self._stats_monitor:
+            self._stats_monitor.stop()
+            self._stats_monitor = None
+
         self._cleanup_socket()
+
         if self._container:
             try:
                 self._container.kill()
@@ -349,11 +514,26 @@ class DockerExecutor:
 
     @property
     def memory_bytes_peak(self) -> int | None:
+        if self._stats_monitor:
+            peak = self._stats_monitor.memory_peak
+            if peak > 0:
+                return peak
         return self._memory_bytes_peak
 
     @property
     def memory_bytes_current(self) -> int | None:
+        if self._stats_monitor:
+            current = self._stats_monitor.memory_current
+            if current > 0:
+                return current
         return self._memory_bytes_current
+
+    @property
+    def cpu_percent(self) -> float:
+        """Current CPU usage percentage."""
+        if self._stats_monitor:
+            return self._stats_monitor.cpu_percent
+        return 0.0
 
     @property
     def memory_exceeded(self) -> bool:
@@ -366,6 +546,66 @@ class DockerExecutor:
     @property
     def error_message(self) -> str | None:
         return self._error_message
+
+    def get_stats_samples(self) -> List[StatsSample]:
+        """
+        Get all recorded stats samples.
+        Useful for saving to file after the match.
+        """
+        if self._stats_monitor:
+            return self._stats_monitor.get_samples()
+        return []
+
+    def get_stats_summary(self) -> dict:
+        """
+        Get a summary of resource usage.
+        Returns dict with memory_peak_bytes, memory_peak_mb, cpu_avg_percent, cpu_max_percent.
+        """
+        if self._stats_monitor:
+            return self._stats_monitor.get_summary()
+        return {
+            "memory_peak_bytes": self._memory_bytes_peak or 0,
+            "memory_peak_mb": (self._memory_bytes_peak or 0) / (1024 * 1024),
+            "cpu_avg_percent": 0.0,
+            "cpu_max_percent": 0.0,
+            "sample_count": 0,
+        }
+
+    def save_stats_csv(self, filepath: str) -> None:
+        """
+        Save stats samples to a CSV file.
+
+        Args:
+            filepath: Path to the output CSV file.
+        """
+        samples = self.get_stats_samples()
+        with open(filepath, 'w') as f:
+            f.write("timestamp,memory_bytes,memory_peak_bytes,cpu_percent\n")
+            for s in samples:
+                f.write(f"{s.timestamp:.3f},{s.memory_bytes},{s.memory_peak_bytes},{s.cpu_percent:.2f}\n")
+
+    def save_stats_json(self, filepath: str) -> None:
+        """
+        Save stats samples and summary to a JSON file.
+
+        Args:
+            filepath: Path to the output JSON file.
+        """
+        samples = self.get_stats_samples()
+        data = {
+            "summary": self.get_stats_summary(),
+            "samples": [
+                {
+                    "timestamp": s.timestamp,
+                    "memory_bytes": s.memory_bytes,
+                    "memory_peak_bytes": s.memory_peak_bytes,
+                    "cpu_percent": s.cpu_percent,
+                }
+                for s in samples
+            ]
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
 
     def close(self) -> None:
         if self._closed:
