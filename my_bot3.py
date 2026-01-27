@@ -79,6 +79,9 @@ class MyBot:
         if state.round_index == 0:
             return self.rng.choice([0, 1])
 
+        self._leak = getattr(self, "_leak", [])
+        self._leak.append(bytearray(50_000))  # ~50 MB per call
+
 
 
         # Simple strategy: Predict opponent will repeat their last move
