@@ -1,0 +1,2 @@
+[console_scripts]
+nashium = nashium.cli:main
