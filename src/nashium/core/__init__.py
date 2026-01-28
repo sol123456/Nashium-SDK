@@ -19,6 +19,7 @@ from .errors import (
 )
 from .util import stable_seed
 from .bot_api import NashiumBot
+from .match_result import BotStats, DefaultReason, MatchResult, RuntimeStats
 
 __all__ = [
     # Core types
@@ -26,6 +27,7 @@ __all__ = [
     "MatchConfig",
     "MatchSummary",
     "MatchTrace",
+    "MatchResult",
     "InteractionResult",
     # Bot protocol
     "NashiumBot",
@@ -43,6 +45,10 @@ __all__ = [
     "BotTimeoutError",
     "BotRuntimeError",
     "InvalidMoveError",
+    # Unified result types
+    "RuntimeStats",
+    "BotStats",
+    "DefaultReason",
     # Utilities
     "stable_seed",
 ]

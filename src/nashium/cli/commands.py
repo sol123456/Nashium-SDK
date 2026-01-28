@@ -461,7 +461,7 @@ def cmd_qualify(args: argparse.Namespace) -> int:
 
             # Calculate per-round wins (1 = submitted bot won, 0 = lost)
             per_round_wins = [
-                1 if s_move != o_move else 0
+                1 if s_move == o_move else 0
                 for s_move, o_move in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
             ]
 
@@ -790,8 +790,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Always use the backend now - it handles all three modes uniformly
     if save_output:
-        trace = backend.run_match_trace_between_files(a_path, b_path, seed, config)
-        summary = trace.summary
+        match_result = backend.run_match_result_between_files(
+            a_path,
+            b_path,
+            seed,
+            config,
+            capture_history=True,
+        )
 
         # Create output folder
         from datetime import datetime
@@ -804,16 +809,22 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         # Write output file (bot_a's moves)
         output_file = match_dir / f"{a_stem}_output.txt"
-        submitted_outputs = "\n".join(str(x) for x in trace.submitted_moves)
+        submitted_outputs = "\n".join(str(x) for x in match_result.submitted_moves)
         if submitted_outputs:
             submitted_outputs += "\n"
         output_file.write_text(submitted_outputs)
 
         # Calculate per-round wins (1 = bot_a won, 0 = lost)
-        per_round_wins = [
-            1 if s_move != o_move else 0
-            for s_move, o_move in zip(trace.submitted_moves, trace.leaderboard_moves_effective)
-        ]
+        if match_result.score_per_round:
+            per_round_wins = list(match_result.score_per_round)
+        else:
+            per_round_wins = [
+                1 if s_move == o_move else 0
+                for s_move, o_move in zip(
+                    match_result.submitted_moves,
+                    match_result.leaderboard_moves_effective,
+                )
+            ]
 
         # Write score file
         score_file = match_dir / f"{a_stem}_score.txt"
@@ -826,65 +837,90 @@ def cmd_run(args: argparse.Namespace) -> int:
             usage_dir = match_dir / "usage"
             usage_dir.mkdir(parents=True, exist_ok=True)
             (usage_dir / "cpu_usage.txt").write_text(
-                "\n".join(str(x) for x in trace.submitted_cpu_usage_samples)
-                + ("\n" if trace.submitted_cpu_usage_samples else ""),
+                "\n".join(str(x) for x in match_result.submitted.cpu_usage_samples)
+                + ("\n" if match_result.submitted.cpu_usage_samples else ""),
                 encoding="utf-8",
             )
             (usage_dir / "ram_usage.txt").write_text(
-                "\n".join(str(x) for x in trace.submitted_ram_usage_samples)
-                + ("\n" if trace.submitted_ram_usage_samples else ""),
+                "\n".join(str(x) for x in match_result.submitted.ram_usage_samples)
+                + ("\n" if match_result.submitted.ram_usage_samples else ""),
                 encoding="utf-8",
             )
 
         print_info(f"Saved match logs to: {match_dir}/")
     else:
-        summary = backend.run_match_between_files(a_path, b_path, seed, config)
+        match_result = backend.run_match_result_between_files(
+            a_path,
+            b_path,
+            seed,
+            config,
+            capture_history=False,
+        )
 
     status, explanation = format_result(
-        summary.result, summary.stat_sig, summary.submitted_wins, summary.rounds
+        match_result.result,
+        match_result.stat_sig,
+        match_result.submitted_wins,
+        match_result.rounds,
     )
 
     print(f"  {Colors.BOLD}Results:{Colors.RESET}")
-    print(f"    Rounds played:     {summary.rounds:,}")
-    print(f"    {a_path.name} wins: {summary.submitted_wins:,} ({summary.submitted_win_rate * 100:.2f}%)")
+    print(f"    Rounds played:     {match_result.rounds:,}")
     print(
-        f"    {b_path.name} wins: {summary.rounds - summary.submitted_wins:,} ({(1 - summary.submitted_win_rate) * 100:.2f}%)")
+        f"    {a_path.name} wins: {match_result.submitted_wins:,} ({match_result.submitted_win_rate * 100:.2f}%)"
+    )
+    print(
+        f"    {b_path.name} wins: {match_result.rounds - match_result.submitted_wins:,} ({(1 - match_result.submitted_win_rate) * 100:.2f}%)")
     print()
     print(f"    Result:            {status}")
     print(f"    {explanation}")
     print()
 
-    if summary.submitted_timed_out or summary.leaderboard_timed_out:
+    if match_result.submitted.timed_out or match_result.leaderboard.timed_out:
         print(f"  {Colors.BOLD}Timeouts:{Colors.RESET}")
-        if summary.submitted_timed_out:
+        if match_result.submitted.timed_out:
             print_warning(f"{a_path.name} exceeded time limit and defaulted to 0 for remaining moves")
-        if summary.leaderboard_timed_out:
+        if match_result.leaderboard.timed_out:
             print_warning(f"{b_path.name} exceeded time limit and defaulted to 0 for remaining moves")
         print()
 
-    if summary.submitted_memory_exceeded or summary.leaderboard_memory_exceeded:
+    if match_result.submitted.memory_exceeded or match_result.leaderboard.memory_exceeded:
         print(f"  {Colors.BOLD}Memory Limits:{Colors.RESET}")
-        if summary.submitted_memory_exceeded:
+        if match_result.submitted.memory_exceeded:
             print_warning(f"{a_path.name} exceeded memory limit and defaulted to 0 for remaining moves")
-        if summary.leaderboard_memory_exceeded:
+        if match_result.leaderboard.memory_exceeded:
             print_warning(f"{b_path.name} exceeded memory limit and defaulted to 0 for remaining moves")
         print()
 
+    if match_result.submitted.errored or match_result.leaderboard.errored:
+        print(f"  {Colors.BOLD}Errors:{Colors.RESET}")
+        if match_result.submitted.errored:
+            print_warning(f"{a_path.name} encountered a runtime error and defaulted to 0 for remaining moves")
+            if match_result.submitted.error_message:
+                for line in match_result.submitted.error_message.splitlines()[:5]:
+                    print_dim(f"    {line}")
+        if match_result.leaderboard.errored:
+            print_warning(f"{b_path.name} encountered a runtime error and defaulted to 0 for remaining moves")
+            if match_result.leaderboard.error_message:
+                for line in match_result.leaderboard.error_message.splitlines()[:5]:
+                    print_dim(f"    {line}")
+        print()
+
     print(f"  {Colors.BOLD}Performance:{Colors.RESET}")
-    print(f"    {a_path.name} time: {summary.submitted_time_seconds:.3f}s")
-    print(f"    {b_path.name} time: {summary.leaderboard_time_seconds:.3f}s")
-    print(f"    Total wall time:   {summary.wall_time_seconds:.3f}s")
-    if summary.submitted_memory_bytes_peak is not None:
-        print(f"    {a_path.name} peak RAM: {summary.submitted_memory_bytes_peak / (1024 * 1024):.1f}MB")
+    print(f"    {a_path.name} time: {match_result.submitted.elapsed_time_seconds:.3f}s")
+    print(f"    {b_path.name} time: {match_result.leaderboard.elapsed_time_seconds:.3f}s")
+    print(f"    Total wall time:   {match_result.wall_time_seconds:.3f}s")
+    if match_result.submitted.memory_bytes_peak is not None:
+        print(f"    {a_path.name} peak RAM: {match_result.submitted.memory_bytes_peak / (1024 * 1024):.1f}MB")
     else:
         print(f"    {a_path.name} peak RAM: n/a")
-    if summary.leaderboard_memory_bytes_peak is not None:
-        print(f"    {b_path.name} peak RAM: {summary.leaderboard_memory_bytes_peak / (1024 * 1024):.1f}MB")
+    if match_result.leaderboard.memory_bytes_peak is not None:
+        print(f"    {b_path.name} peak RAM: {match_result.leaderboard.memory_bytes_peak / (1024 * 1024):.1f}MB")
     else:
         print(f"    {b_path.name} peak RAM: n/a")
 
-    if config.max_total_memory_bytes_per_bot is not None and summary.submitted_memory_bytes_peak is not None:
-        print(f"    {a_path.name} memory: {format_memory_warning(summary.submitted_memory_bytes_peak, config.max_total_memory_bytes_per_bot)}")
+    if config.max_total_memory_bytes_per_bot is not None and match_result.submitted.memory_bytes_peak is not None:
+        print(f"    {a_path.name} memory: {format_memory_warning(match_result.submitted.memory_bytes_peak, config.max_total_memory_bytes_per_bot)}")
         print_dim("    (Limit includes Python/runtime overhead.)")
     print()
 

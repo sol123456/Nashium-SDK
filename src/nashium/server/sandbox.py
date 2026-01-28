@@ -45,6 +45,8 @@ class SubprocessExecutor:
         self._time_limit = time_limit
         self._elapsed_time = 0.0
         self._timed_out = False
+        self._errored = False
+        self._error_message: str | None = None
         self._memory_limit_bytes = memory_limit_bytes
         self._memory_bytes_peak: int | None = None
         self._memory_bytes_current: int | None = None
@@ -226,6 +228,9 @@ class SubprocessExecutor:
         if self._memory_exceeded:
             return 0
 
+        if self._errored:
+            return 0
+
         if self._closed:
             return 0
 
@@ -245,7 +250,10 @@ class SubprocessExecutor:
             return 0
 
         if response.get("status") == "error":
-            raise BotRuntimeError(response.get("error", "Unknown error"), RuntimeError())
+            self._errored = True
+            self._error_message = response.get("error", "Unknown error")
+            self._kill_process()
+            return 0
 
         move = response.get("move", 0)
         elapsed = response.get("time", 0.0)
@@ -348,6 +356,14 @@ class SubprocessExecutor:
     @property
     def memory_exceeded(self) -> bool:
         return self._memory_exceeded
+
+    @property
+    def errored(self) -> bool:
+        return self._errored
+
+    @property
+    def error_message(self) -> str | None:
+        return self._error_message
 
     def close(self) -> None:
         """Terminate the subprocess and clean up resources."""

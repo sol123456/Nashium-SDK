@@ -58,6 +58,8 @@ class MatchTrace:
     leaderboard_moves_effective: tuple[int, ...]
     submitted_cpu_usage_samples: tuple[int, ...] = ()
     submitted_ram_usage_samples: tuple[int, ...] = ()
+    leaderboard_cpu_usage_samples: tuple[int, ...] = ()
+    leaderboard_ram_usage_samples: tuple[int, ...] = ()
 
 
 def _compute_result(submitted_wins: int, config: MatchConfig) -> tuple[InteractionResult, bool]:
