@@ -6,6 +6,8 @@ Author: Nashium
 License: MIT
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+Requires-Dist: requests>=2.28.0
+Requires-Dist: pydantic>=2.0.0
 
 # Nashium Python SDK
 

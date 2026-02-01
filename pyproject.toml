@@ -11,15 +11,6 @@ requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Nashium"}]
 
-[project.scripts]
-nashium = "nashium.cli:main"
-
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
 dependencies = [
     # ... existing deps ...
     "requests>=2.28.0",
@@ -27,4 +18,12 @@ dependencies = [
 ]
 
 [project.scripts]
-nashium-worker = "nashium_sdk.worker.__main__:main"
+nashium = "nashium.cli:main"
+nashium-worker = "nashium.worker.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
