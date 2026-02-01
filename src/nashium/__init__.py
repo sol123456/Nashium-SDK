@@ -27,6 +27,6 @@ from nashium.core.engine import (
 )
 from nashium.core.match_result import BotStats, DefaultReason, MatchResult, RuntimeStats
 from nashium.cli.loader import load_bot_from_file
-from nashium.api import run_match_result_from_code_strings
+from nashium.worker.api import run_match_result_from_code_strings
 
 __version__ = "0.1.0"

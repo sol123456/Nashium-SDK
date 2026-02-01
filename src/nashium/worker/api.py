@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .cli.backend import get_backend
-from .core.engine import MatchConfig
-from .core.match_result import MatchResult
-from .core.util import stable_seed
+from nashium.cli.backend import get_backend
+from nashium.core.engine import MatchConfig
+from nashium.core.match_result import MatchResult
+from nashium.core.util import stable_seed
 
 
 _CREATE_BOT_SHIM = """

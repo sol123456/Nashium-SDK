@@ -19,3 +19,12 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+dependencies = [
+    # ... existing deps ...
+    "requests>=2.28.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+nashium-worker = "nashium_sdk.worker.__main__:main"
