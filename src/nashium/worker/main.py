@@ -17,25 +17,33 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import subprocess
+import re
 
 
 def get_wsl_host_ip() -> str:
     """
-    Get the Windows host IP from within WSL2.
-
-    Returns the IP that can be used to reach Windows from WSL2.
+    Get the Windows host IP by looking at the WSL default gateway.
     """
     try:
-        # Try reading from /etc/resolv.conf (WSL2 sets this to the host)
-        with open("/etc/resolv.conf", "r") as f:
-            for line in f:
-                if line.startswith("nameserver"):
-                    return line.split()[1]
+        # Run 'ip route show default'
+        # Output looks like: "default via 172.31.96.1 dev eth0..."
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True,
+            text=True
+        )
+
+        # Regex to grab the IP after the word 'via'
+        match = re.search(r"via\s+([\d\.]+)", result.stdout)
+        if match:
+            return match.group(1)
+
     except Exception:
         pass
 
-    # Fallback - try common WSL2 gateway
-    return "172.17.0.1"
+    # Fallback to the External IP you saw in logs (as a last resort)
+    return "192.168.0.184"
 
 
 def main():

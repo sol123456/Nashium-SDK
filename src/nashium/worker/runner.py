@@ -27,6 +27,22 @@ from .api import run_match_result_from_code_strings
 logger = logging.getLogger(__name__)
 
 
+# Default bot that always returns 0
+DEFAULT_BOT_CODE = '''
+"""Default bot - returns 0 for every move (used when actual bot code is invalid)."""
+
+class Bot:
+    def __init__(self, seed=None):
+        pass
+    
+    def move(self, state):
+        return 0
+
+def create_bot(seed=None):
+    return Bot(seed)
+'''
+
+
 @dataclass
 class WorkerConfig:
     """Configuration for the worker."""
@@ -54,18 +70,41 @@ class WorkerConfig:
     log_level: str = "INFO"
 
 
+def _is_valid_python(code: str) -> tuple[bool, Optional[str]]:
+    """
+    Check if code is syntactically valid Python.
+
+    Returns:
+        (True, None) if valid
+        (False, error_message) if invalid
+    """
+    if not code or not code.strip():
+        return False, "No code provided"
+    try:
+        compile(code, "<bot>", "exec")
+        return True, None
+    except SyntaxError as e:
+        return False, f"SyntaxError: {e}"
+
+
 def _build_runtime_stats_dto(
     runtime: RuntimeStats,
     stats: Optional[BotStats],
     moves: tuple[int, ...],
+    override_errored: bool = False,
+    override_error_msg: Optional[str] = None,
 ) -> RuntimeStatsSubmissionDTO:
     """Convert SDK RuntimeStats + BotStats to the submission DTO."""
+
+    # Use override if provided, otherwise use runtime's values
+    errored = override_errored or runtime.errored
+    error_msg = override_error_msg if override_errored else runtime.error_message
 
     return RuntimeStatsSubmissionDTO(
         timedOut=runtime.timed_out,
         memoryExceeded=runtime.memory_exceeded,
-        errored=runtime.errored,
-        errorMessage=runtime.error_message,
+        errored=errored,
+        errorMessage=error_msg,
         maxMemory=float(runtime.memory_bytes_peak) if runtime.memory_bytes_peak else None,
         endCpuTime=runtime.elapsed_time_seconds,
         cpuUsageSamples=list(runtime.cpu_usage_samples) if runtime.cpu_usage_samples else None,
@@ -82,6 +121,10 @@ def _build_runtime_stats_dto(
 def _match_result_to_submission(
     interaction_id: int,
     result: MatchResult,
+    submitted_errored: bool = False,
+    submitted_error_msg: Optional[str] = None,
+    leaderboard_errored: bool = False,
+    leaderboard_error_msg: Optional[str] = None,
 ) -> MatchResultSubmissionDTO:
     """Convert SDK MatchResult to the API submission DTO."""
 
@@ -93,11 +136,15 @@ def _match_result_to_submission(
             result.submitted,
             result.submitted_stats,
             result.submitted_moves,
+            override_errored=submitted_errored,
+            override_error_msg=submitted_error_msg,
         ),
         leaderboard=_build_runtime_stats_dto(
             result.leaderboard,
             result.leaderboard_stats,
             result.leaderboard_moves_effective,
+            override_errored=leaderboard_errored,
+            override_error_msg=leaderboard_error_msg,
         ),
     )
 
@@ -180,36 +227,60 @@ class Worker:
             f"{submitted_bot.name} vs {leaderboard_bot.name}"
         )
 
-        # 2. Validate we have code
-        if not submitted_bot.code:
-            logger.error(f"Submitted bot {submitted_bot.id} has no code!")
-            raise NashiumClientError("Submitted bot has no source code")
+        # 2. Get code, defaulting to empty string
+        submitted_code = submitted_bot.code or ""
+        leaderboard_code = leaderboard_bot.code or ""
 
-        if not leaderboard_bot.code:
-            logger.error(f"Leaderboard bot {leaderboard_bot.id} has no code!")
-            raise NashiumClientError("Leaderboard bot has no source code")
+        # Keep original code for seed generation
+        original_submitted = submitted_code
+        original_leaderboard = leaderboard_code
 
-        # 3. Generate secure deterministic seed
-        seed = self._generate_seed(submitted_bot.code, leaderboard_bot.code)
+        # Track if we had to replace either bot
+        submitted_errored = False
+        leaderboard_errored = False
+        submitted_error_msg: Optional[str] = None
+        leaderboard_error_msg: Optional[str] = None
+
+        # 3. Validate submitted bot code
+        valid, error = _is_valid_python(submitted_code)
+        if not valid:
+            submitted_errored = True
+            submitted_error_msg = error
+            submitted_code = DEFAULT_BOT_CODE
+            logger.warning(
+                f"Submitted bot '{submitted_bot.name}' has invalid code: {error} "
+                f"- replacing with default (all 0s)"
+            )
+
+        # 4. Validate leaderboard bot code
+        valid, error = _is_valid_python(leaderboard_code)
+        if not valid:
+            leaderboard_errored = True
+            leaderboard_error_msg = error
+            leaderboard_code = DEFAULT_BOT_CODE
+            logger.warning(
+                f"Leaderboard bot '{leaderboard_bot.name}' has invalid code: {error} "
+                f"- replacing with default (all 0s)"
+            )
+
+        # 5. Generate seed from ORIGINAL code (before any replacements)
+        # This ensures the seed is consistent regardless of whether we replaced code
+        seed = self._generate_seed(original_submitted, original_leaderboard)
         logger.info(f"Generated seed: {seed}")
 
-        # 4. Run the match
+        # 6. Run the match
         logger.info(f"Running match ({self.config.rounds} rounds)...")
         start_time = time.perf_counter()
 
-        try:
-            result = run_match_result_from_code_strings(
-                submitted_code=submitted_bot.code,
-                leaderboard_code=leaderboard_bot.code,
-                seed=seed,
-                config=self.match_config,
-                sandbox=False,      # Not using Python sandbox
-                docker=True,        # Using Docker for isolation
-                capture_history=True,  # Need moves for statistics
-            )
-        except Exception as e:
-            logger.error(f"Match execution failed: {e}")
-            raise
+        result = run_match_result_from_code_strings(
+            submitted_code=submitted_code,
+            leaderboard_code=leaderboard_code,
+            seed=seed,
+            config=self.match_config,
+            sandbox=False,
+            docker=True,
+            capture_history=True,
+        )
 
         elapsed = time.perf_counter() - start_time
         logger.info(
@@ -218,10 +289,17 @@ class Worker:
             f"submitted_wins={result.submitted_wins}/{result.rounds}"
         )
 
-        # 5. Convert to submission DTO
-        submission = _match_result_to_submission(interaction.id, result)
+        # 7. Build submission, including any pre-run errors
+        submission = _match_result_to_submission(
+            interaction.id,
+            result,
+            submitted_errored=submitted_errored,
+            submitted_error_msg=submitted_error_msg,
+            leaderboard_errored=leaderboard_errored,
+            leaderboard_error_msg=leaderboard_error_msg,
+        )
 
-        # 6. Submit results
+        # 8. Submit results
         logger.info(f"Submitting results for interaction {interaction.id}...")
         updated = self.client.submit_result(submission)
 
