@@ -181,18 +181,17 @@ class NashiumClient:
 
     def health_check(self) -> bool:
         """
-        Check if the server is reachable.
+        Check if the server is reachable and the worker token is valid.
 
         Returns:
-            True if server responds, False otherwise.
+            True if server responds with 200, False otherwise.
         """
         try:
-            # Try to claim (will either succeed or return 204)
-            response = self.session.post(
-                self._url("/api/worker/claim-next"),
+            response = self.session.get(
+                self._url("/api/worker/health"),
                 timeout=5.0
             )
-            return response.status_code in (200, 204, 401)
+            return response.status_code == 200
         except Exception:
             return False
 

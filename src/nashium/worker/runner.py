@@ -266,6 +266,7 @@ class Worker:
         # 5. Generate seed from ORIGINAL code (before any replacements)
         # This ensures the seed is consistent regardless of whether we replaced code
         seed = self._generate_seed(original_submitted, original_leaderboard)
+        seed = seed & 0x7FFFFFFF  # Mask to fit in signed 32-bit integer (0 to 2,147,483,647)
         logger.info(f"Generated seed: {seed}")
 
         # 6. Run the match
