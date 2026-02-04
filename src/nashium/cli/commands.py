@@ -815,8 +815,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         output_file.write_text(submitted_outputs)
 
         # Calculate per-round wins (1 = bot_a won, 0 = lost)
-        if match_result.score_per_round:
-            per_round_wins = list(match_result.score_per_round)
+        if match_result.submitted_performance:
+            per_round_wins = list(match_result.submitted_performance)
         else:
             per_round_wins = [
                 1 if s_move == o_move else 0

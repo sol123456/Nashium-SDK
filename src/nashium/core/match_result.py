@@ -115,7 +115,7 @@ class MatchResult:
     leaderboard_moves_raw: tuple[int, ...] = ()
     leaderboard_moves_effective: tuple[int, ...] = ()
 
-    score_per_round: tuple[int, ...] = ()
+    submitted_performance: tuple[int, ...] = ()
     leaderboard_output_deduced: tuple[int, ...] = ()
 
     submitted_stats: BotStats | None = None

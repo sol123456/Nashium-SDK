@@ -91,6 +91,7 @@ def _build_runtime_stats_dto(
     runtime: RuntimeStats,
     stats: Optional[BotStats],
     moves: tuple[int, ...],
+    performance: tuple[int, ...],
     override_errored: bool = False,
     override_error_msg: Optional[str] = None,
 ) -> RuntimeStatsSubmissionDTO:
@@ -110,6 +111,7 @@ def _build_runtime_stats_dto(
         cpuUsageSamples=list(runtime.cpu_usage_samples) if runtime.cpu_usage_samples else None,
         ramUsageSamples=list(runtime.ram_usage_samples) if runtime.ram_usage_samples else None,
         moves=list(moves) if moves else None,
+        performance=list(performance) if performance else None,
         wins=stats.wins if stats else None,
         losses=stats.losses if stats else None,
         entropy=stats.entropy if stats else None,
@@ -128,6 +130,11 @@ def _match_result_to_submission(
 ) -> MatchResultSubmissionDTO:
     """Convert SDK MatchResult to the API submission DTO."""
 
+    # Compute leaderboard's performance (inverse of submitted's score_per_round)
+    # score_per_round: 1 = submitted won, 0 = submitted lost
+    # leaderboard_performance: 1 = leaderboard won, 0 = leaderboard lost
+    leaderboard_performance = tuple(1 - x for x in result.submitted_performance)
+
     return MatchResultSubmissionDTO(
         interactionId=interaction_id,
         seed=result.seed,
@@ -136,6 +143,7 @@ def _match_result_to_submission(
             result.submitted,
             result.submitted_stats,
             result.submitted_moves,
+            result.submitted_performance,  # Submitted's perspective
             override_errored=submitted_errored,
             override_error_msg=submitted_error_msg,
         ),
@@ -143,6 +151,7 @@ def _match_result_to_submission(
             result.leaderboard,
             result.leaderboard_stats,
             result.leaderboard_moves_effective,
+            leaderboard_performance,  # Leaderboard's perspective (computed above)
             override_errored=leaderboard_errored,
             override_error_msg=leaderboard_error_msg,
         ),

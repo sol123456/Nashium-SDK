@@ -62,6 +62,7 @@ class RuntimeStatsSubmissionDTO(BaseModel):
     cpuUsageSamples: Optional[List[int]] = None
     ramUsageSamples: Optional[List[int]] = None
     moves: Optional[List[int]] = None
+    performance: Optional[List[int]] = None
 
     wins: Optional[int] = None
     losses: Optional[int] = None
