@@ -58,7 +58,7 @@ class WorkerConfig:
     rounds: int = 10_000
     stat_sig_win_threshold: int = 5155
     max_time_per_bot: float = 100.0
-    max_memory_per_bot: Optional[int] = None
+    max_memory_per_bot: int = 200 * 1024 * 1024  # 200MB default
 
     # Worker behavior
     poll_interval_seconds: float = 2.0
@@ -178,7 +178,7 @@ class Worker:
             rounds=config.rounds,
             stat_sig_win_threshold=config.stat_sig_win_threshold,
             max_total_time_seconds_per_bot=config.max_time_per_bot,
-            max_total_memory_bytes_per_bot=config.max_memory_per_bot,
+            max_total_memory_bytes_per_bot=config.max_memory_per_bot or (200 * 1024 * 1024),
         )
 
         self._running = False
