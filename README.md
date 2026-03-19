@@ -12,11 +12,33 @@ In Nashium, your bot's `move(...)` is your *prediction* of your opponent's next 
 
 ## Installation
 
+Before installing, make sure you are in the correct inner directory:
+
+```bash
+cd Nashium-SDK-2
+```
+
+Then install the package:
+
 ```bash
 pip install -e .
 ```
 
+**Windows Users:** The `nashium` command may not work directly after installation. You have two options:
+
+1. Prefix every command with `python -m`:
+   ```bash
+   python -m nashium scaffold my_bot.py
+   python -m nashium qualify my_bot.py
+   ```
+
+2. Or add the Python Scripts directory to your PATH (replace `<user>` with your Windows username):
+   ```powershell
+   $env:Path += ";C:\Users\<user>\AppData\Roaming\Python\Python313\Scripts"
+   ```
+
 ---
+
 
 ## Usage Guide
 
