@@ -287,9 +287,7 @@ class Worker:
             leaderboard_code=leaderboard_code,
             seed=seed,
             config=self.match_config,
-            sandbox=False,
-            docker=True,
-            capture_history=True,
+            capture_history=True,  # removed sandbox=False, docker=True
         )
 
         elapsed = time.perf_counter() - start_time

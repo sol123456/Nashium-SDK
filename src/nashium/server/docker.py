@@ -303,7 +303,7 @@ class DockerExecutor:
         try:
             self._container = self._client.containers.run(
                 image=self._config.image,
-                command=["python", "/app/_subprocess_runner.py", "/ipc/ipc.sock"],
+                command=["python", "/app/_docker_runner.py", "/ipc/ipc.sock"],
                 detach=True,
                 mem_limit=self._config.memory_limit,
                 cpu_quota=self._config.cpu_quota,
@@ -689,14 +689,8 @@ class DockerBackend(Backend):
     def name(self) -> str:
         return "docker container"
 
-    def _run_match_result_internal(
-        self,
-        submitted_source: str,
-        opponent_source: str,
-        seed: int,
-        config: MatchConfig,
-        capture_history: bool,
-    ) -> MatchResult:
+    def run_match_result_from_strings(self, submitted_source: str, opponent_source: str, seed: int, config: MatchConfig,
+                                      capture_history: bool = False) -> MatchResult:
         start = time.perf_counter()
 
         with DockerExecutor(
@@ -870,17 +864,3 @@ class DockerBackend(Backend):
                 )
 
                 return match_result
-
-    def run_match_result_between_files(
-        self,
-        path_a: Path,
-        path_b: Path,
-        seed: int,
-        config: MatchConfig,
-        capture_history: bool = False,
-    ) -> MatchResult:
-        source_a = path_a.read_text()
-        source_b = path_b.read_text()
-        return self._run_match_result_internal(
-            source_a, source_b, seed, config, capture_history=capture_history
-        )

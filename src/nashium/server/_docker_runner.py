@@ -100,75 +100,6 @@ def load_bot(code: str, seed: int | None = None):
                 pass
     return cls()
 
-
-# ============================================================
-# STDIO MODE (for sandbox - stdin/stdout JSON)
-# ============================================================
-
-def stdio_send(data: dict) -> None:
-    print(json.dumps(data), flush=True)
-
-
-def stdio_recv() -> dict | None:
-    try:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        return json.loads(line.strip())
-    except Exception as e:
-        stdio_send({"status": "error", "error": f"Failed to read input: {e}"})
-        return None
-
-
-def run_stdio_mode():
-    """Original stdin/stdout JSON protocol for subprocess/sandbox mode."""
-    runner: BotRunner | None = None
-
-    while True:
-        cmd = stdio_recv()
-        if cmd is None:
-            break
-
-        command = cmd.get("cmd")
-
-        if command == "quit":
-            break
-
-        elif command == "load":
-            try:
-                bot = load_bot(cmd["code"], seed=cmd.get("seed"))
-                runner = BotRunner(bot)
-                stdio_send({"status": "ok"})
-            except Exception as e:
-                stdio_send({
-                    "status": "error",
-                    "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-                })
-
-        elif command == "reset":
-            if runner is None:
-                stdio_send({"status": "error", "error": "Bot not loaded"})
-            else:
-                runner.reset()
-                stdio_send({"status": "ok"})
-
-        elif command == "move":
-            if runner is None:
-                stdio_send({"status": "error", "error": "Bot not loaded"})
-                continue
-            try:
-                move, elapsed = runner.make_move(cmd.get("opponent_last"))
-                stdio_send({"status": "ok", "move": move, "time": elapsed})
-            except Exception as e:
-                stdio_send({
-                    "status": "error",
-                    "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-                })
-
-        else:
-            stdio_send({"status": "error", "error": f"Unknown command: {command}"})
-
-
 # ============================================================
 # SOCKET MODE (for Docker - Unix socket binary protocol)
 # ============================================================
@@ -251,12 +182,12 @@ def run_socket_mode(sock_path: str):
 # ============================================================
 
 def main():
-    if len(sys.argv) >= 2:
-        # Docker mode: Unix socket
-        run_socket_mode(sys.argv[1])
-    else:
-        # Sandbox mode: stdin/stdout
-        run_stdio_mode()
+    if len(sys.argv) < 2:
+        print("Error: Socket path argument required", file=sys.stderr)
+        sys.exit(1)
+
+    # Docker mode: Unix socket
+    run_socket_mode(sys.argv[1])
 
 
 if __name__ == "__main__":

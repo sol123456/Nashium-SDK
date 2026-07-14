@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY _subprocess_runner.py /app/
+COPY _docker_runner.py /app/
 
 # Install packages that are also available in the Pyodide/micropip ecosystem.
 RUN pip install --no-cache-dir \

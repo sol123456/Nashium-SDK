@@ -1,56 +1,18 @@
 from __future__ import annotations
 
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 from nashium.core.engine import MatchConfig
 from nashium.core.match_result import MatchResult
 from nashium.core.util import stable_seed
 from nashium.server.docker import DockerBackend
 
 
-_CREATE_BOT_SHIM = """
-
-def create_bot(seed: int):
-    cls = globals().get("Bot")
-    if cls is None:
-        for name, obj in globals().items():
-            if (
-                isinstance(obj, type)
-                and callable(getattr(obj, "move", None))
-                and name not in ("RoundState",)
-            ):
-                cls = obj
-                break
-
-    if cls is None:
-        raise ValueError("No bot class found in source code")
-
-    try:
-        return cls(seed=seed)
-    except TypeError:
-        try:
-            return cls(seed)
-        except TypeError:
-            return cls()
-"""
-
-
-def _ensure_create_bot(code: str) -> str:
-    if "def create_bot" in code:
-        return code
-    return code + _CREATE_BOT_SHIM
-
-
 def run_match_result_from_code_strings(
-    submitted_code: str,
-    leaderboard_code: str,
-    *,
-    seed: int | None = None,
-    config: MatchConfig | None = None,
-    sandbox: bool = True,
-    docker: bool = False,
-    capture_history: bool = True,
+        submitted_code: str,
+        leaderboard_code: str,
+        *,
+        seed: int | None = None,
+        config: MatchConfig | None = None,
+        capture_history: bool = True,
 ) -> MatchResult:
     if config is None:
         config = MatchConfig()
@@ -58,20 +20,12 @@ def run_match_result_from_code_strings(
     if seed is None:
         seed = stable_seed(submitted_code.encode("utf-8"), leaderboard_code.encode("utf-8"))
 
-    # Server runner only uses Docker for isolation
+    # Pass strings directly to Docker via the backend
     backend = DockerBackend()
-
-    with TemporaryDirectory(prefix="nashium_bots_") as tmp:
-        a = Path(tmp) / "submitted.py"
-        b = Path(tmp) / "leaderboard.py"
-
-        a.write_text(_ensure_create_bot(submitted_code), encoding="utf-8")
-        b.write_text(_ensure_create_bot(leaderboard_code), encoding="utf-8")
-
-        return backend.run_match_result_between_files(
-            a,
-            b,
-            seed,
-            config,
-            capture_history=capture_history,
-        )
+    return backend.run_match_result_from_strings(
+        submitted_code,
+        leaderboard_code,
+        seed,
+        config,
+        capture_history=capture_history,
+    )
