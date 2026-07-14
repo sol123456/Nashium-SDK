@@ -4,12 +4,9 @@ from .engine import (
     MatchSummary,
     MatchTrace,
     RoundState,
-    run_match,
-    run_match_trace,
     run_match_with_executors,
     run_match_trace_with_executors,
 )
-from .executor import BotExecutor, LocalExecutor
 from .errors import (
     BotLoadError,
     BotRuntimeError,
@@ -18,7 +15,6 @@ from .errors import (
     NashiumError,
 )
 from .util import stable_seed
-from .bot_api import NashiumBot
 from .match_result import BotStats, DefaultReason, MatchResult, RuntimeStats
 
 __all__ = [
@@ -29,16 +25,9 @@ __all__ = [
     "MatchTrace",
     "MatchResult",
     "InteractionResult",
-    # Bot protocol
-    "NashiumBot",
     # Match runners
-    "run_match",
-    "run_match_trace",
     "run_match_with_executors",
     "run_match_trace_with_executors",
-    # Executors
-    "BotExecutor",
-    "LocalExecutor",
     # Errors
     "NashiumError",
     "BotLoadError",

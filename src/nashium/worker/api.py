@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from nashium.cli.backend import get_backend
 from nashium.core.engine import MatchConfig
 from nashium.core.match_result import MatchResult
 from nashium.core.util import stable_seed
+from nashium.server.docker import DockerBackend
 
 
 _CREATE_BOT_SHIM = """
@@ -58,7 +58,8 @@ def run_match_result_from_code_strings(
     if seed is None:
         seed = stable_seed(submitted_code.encode("utf-8"), leaderboard_code.encode("utf-8"))
 
-    backend = get_backend(sandbox=sandbox, docker=docker)
+    # Server runner only uses Docker for isolation
+    backend = DockerBackend()
 
     with TemporaryDirectory(prefix="nashium_bots_") as tmp:
         a = Path(tmp) / "submitted.py"

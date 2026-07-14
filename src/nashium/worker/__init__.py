@@ -4,8 +4,8 @@ Nashium Worker - Bridge between JHipster backend and the match execution engine.
 
 # Don't import from runner here to avoid circular imports
 # Users should import directly:
-#   from nashium_sdk.worker.runner import Worker, WorkerConfig
-#   from nashium_sdk.worker.client import NashiumClient
+#   from nashium.worker.runner import Worker, WorkerConfig
+#   from nashium.worker.client import NashiumClient
 
 __all__ = ["Worker", "WorkerConfig", "NashiumClient"]
 

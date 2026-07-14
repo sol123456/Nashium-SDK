@@ -1,21 +1,17 @@
-# Nashium Python SDK
+# Nashium Server Runner
 
-Create and test your matching pennies bot for the Nashium competition.
+Worker for executing Nashium competition matches in Docker containers.
 
-Your challenge: **guess whether your opponent will output a `1` or a `0`** each round.
-
-In Nashium, your bot's `move(...)` is your *prediction* of your opponent's next move:
-- If you match your opponent's move, you win the round.
-- If you don't match, you lose the round.
+This is the server-side component that runs matches between submitted bots and leaderboard bots using Docker containerization for isolation and resource management.
 
 ---
 
 ## Installation
 
-Before installing, make sure you are in the correct inner directory:
+Before installing, make sure you are in the correct directory:
 
 ```bash
-cd Nashium-SDK-2
+cd Nashium-SDK
 ```
 
 Then install the package:
@@ -24,252 +20,103 @@ Then install the package:
 pip install -e .
 ```
 
-**Windows Users:** The `nashium` command may not work directly after installation. You have two options:
-
-1. Prefix every command with `python -m`:
-   ```bash
-   python -m nashium scaffold my_bot.py
-   python -m nashium qualify my_bot.py
-   ```
-
-2. Or add the Python Scripts directory to your PATH (replace `<user>` with your Windows username):
-   ```powershell
-   $env:Path += ";C:\Users\<user>\AppData\Roaming\Python\Python313\Scripts"
-   ```
-
 ---
 
+## Usage
 
-## Usage Guide
+The worker connects to a Nashium server API to claim and execute matches.
 
-This section walks through the full workflow and documents all available commands.
+### Environment Variables
 
----
+- `NASHIUM_API_URL` - Base URL of the Nashium server (default: `http://localhost:8080`)
+- `NASHIUM_WORKER_TOKEN` - Authentication token for the worker API (required)
+- `NASHIUM_SEED_SECRET` - Secret key for deterministic seed generation (required)
+- `NASHIUM_ROUNDS` - Number of rounds per match (default: `10000`)
+- `NASHIUM_MAX_TIME` - Max CPU time per bot in seconds (default: `100.0`)
+- `NASHIUM_POLL_INTERVAL` - Seconds between polls when work is available (default: `2.0`)
+- `NASHIUM_IDLE_INTERVAL` - Seconds between polls when idle (default: `10.0`)
+- `NASHIUM_LOG_LEVEL` - Logging level (default: `INFO`)
 
-### Create a Bot
-
-Create a new bot from the template:
+### Running the Worker
 
 ```bash
-nashium scaffold my_bot.py
+nashium-worker --api-url http://localhost:8080 --token YOUR_TOKEN --seed-secret YOUR_SECRET
 ```
 
-This creates a template bot file with documentation and a simple strategy to get you started.
-
-What you code:
-- A `Bot` class (recommended) with a `move(state: RoundState) -> int` method that returns `0` or `1`.
-
-What you get access to each round:
-- `state.round_index`
-- `state.my_history` (your previous guesses)
-- `state.opponent_history` (the opponent's previous moves)
-
----
-
-### Test Your Bot (Qualification)
-
-Run the qualifier to test against sample opponents:
+Or with environment variables:
 
 ```bash
-nashium qualify my_bot.py
+export NASHIUM_API_URL=http://localhost:8080
+export NASHIUM_WORKER_TOKEN=xxx
+export NASHIUM_SEED_SECRET=yyy
+nashium-worker
 ```
 
-This will:
+### WSL2 Note
 
-- Check that your bot is deterministic
-- Run matches against sample opponents:
-  - always_heads
-  - always_tails
-  - alternator
-  - mirror
-  - frequency_counter
-- Report whether you qualify (must exceed **51.55% win rate**)
-
-Additional examples:
+If running in WSL2 and the Nashium server is on Windows, use the `--wsl-host` flag to auto-detect the Windows host IP:
 
 ```bash
-nashium qualify my_bot.py --seed 12345
-nashium qualify my_bot.py --rounds 5000
-nashium qualify my_bot.py --sandbox
-nashium qualify my_bot.py --docker
-nashium qualify my_bot.py --memory 200m
+nashium-worker --wsl-host --token "xxx" --seed-secret "yyy"
 ```
 
-Save logs for every match the qualifier runs:
+### Single Match Mode
+
+For testing, run a single match and exit:
 
 ```bash
-nashium qualify my_bot.py --save-output
-nashium qualify my_bot.py --save-output --save-output-dir my_logs
+nashium-worker --single --api-url http://localhost:8080 --token YOUR_TOKEN --seed-secret YOUR_SECRET
 ```
 
 ---
 
-### Check Determinism
+## Docker Setup
 
-Verify that your bot behaves deterministically:
+The worker uses Docker for sandboxed execution. Make sure Docker is installed and running.
+
+Build the Docker image:
 
 ```bash
-nashium check my_bot.py
-nashium check my_bot.py --seed 12345
-nashium check my_bot.py --sandbox
-nashium check my_bot.py --docker
-nashium check my_bot.py --memory 200m
+cd src/nashium/server
+docker build -t nashium-runner:latest .
 ```
 
 ---
 
-### Run Head-to-Head Matches
+## Configuration
 
-Run a match between two bots:
+The worker can be configured with the following command-line options:
 
-```bash
-nashium run bot_a.py bot_b.py
-nashium run bot_a.py bot_b.py --seed 12345
-nashium run bot_a.py bot_b.py --sandbox
-nashium run bot_a.py bot_b.py --docker
-nashium run bot_a.py bot_b.py --docker --memory 300m
-```
-
-Save match logs to files:
-
-```bash
-nashium run bot_a.py bot_b.py --save-output
-nashium run bot_a.py bot_b.py --save-output --save-output-dir my_logs
-```
-
-When `--save-output` is enabled, Nashium writes logs under a timestamped folder.
-
-- `*_output.txt`
-  The submitted bot's outputs for each round (one `0`/`1` per line).
-- `*_score.txt`
-  The per-round score as `1`/`0` (one per line).
-
-In `--sandbox` / `--docker` modes it also writes:
-
-- `usage/cpu_usage.txt`
-  CPU usage samples over time.
-- `usage/ram_usage.txt`
-  RAM usage samples over time.
-
-Each usage sample is an integer in `[0, 1000]` representing the fraction of the total budget used.
-
-Filenames include bot names and seed, for example:
-
-`my_bot.py vs always_heads (seed 12345) (output).log`
-
-`my_bot.py vs always_heads (seed 12345) (score).txt`
+- `--api-url` - Base URL of the Nashium server
+- `--token` - Worker authentication token (required)
+- `--seed-secret` - Secret key for seed generation (required)
+- `--rounds` - Number of rounds per match (default: `10000`)
+- `--max-time` - Max CPU time per bot in seconds (default: `100.0`)
+- `--poll-interval` - Seconds between polls when work is available (default: `2.0`)
+- `--idle-interval` - Seconds between polls when idle (default: `10.0`)
+- `--log-level` - Logging level (default: `INFO`)
+- `--wsl-host` - Auto-detect WSL2 host IP for API URL
+- `--single` - Run a single match and exit (for testing)
 
 ---
 
-## Common Options
+## Architecture
 
-The following options are shared by **check**, **run**, and **qualify**:
+The worker consists of:
 
-- `--rounds <int>` Number of rounds per match. Default: `10_000`.
-
-- `--seed <int>` Use a specific random seed for reproducibility.
-
-- `--time-budget <float>` Total time limit in seconds. Default (and server value): **100.0 seconds**
-
-- `--memory <value>` Memory limit per bot for `--sandbox`/`--docker` (e.g. `200m`, `200mb`, `209715200`). Default (sandbox/docker): **200MB**.
-
-- `--sandbox` Run each bot in a separate subprocess. This is slower with worse error logging, but can handle hanging code.
-
-- `--docker` Run each bot in a Docker container (matches the server environment). 
-  - Requires linux environment and running docker container. 
-  - Configure with `cd src/nashium/server` then `docker build -t nashium-runner:latest .`
+- **Worker** - Main loop that polls for work, executes matches, and submits results
+- **NashiumClient** - HTTP client for communicating with the server API
+- **DockerExecutor** - Executes bot code in isolated Docker containers
+- **DockerBackend** - Backend abstraction for Docker-based match execution
 
 ---
 
-## Sandbox vs Local Execution
+## Match Execution
 
-Nashium supports three execution modes:
-
-- **Local (default)**
-  Runs both bots in the current Python process.
-  Fastest, easiest to debug.
-  CPU time is still enforced, but **per-bot RAM usage is not measured** in this mode.
-
-- **Sandbox (`--sandbox`)**
-  Runs each bot in a separate subprocess.
-  Enforces CPU time and (optionally) memory limits.
-  RAM usage is measured from the host (not inside untrusted code).
-
-- **Docker (`--docker`)**
-  Runs each bot in a container with CPU/memory limits.
-  RAM usage is measured from the host via Docker stats.
-
----
-
-## Bot Requirements
-
-Your bot must:
-
-- Return either `0` or `1` from `move()`.
-- Be deterministic given the same seed.
-- Stay within the CPU time budget (and memory budget in sandbox/docker).
-
----
-
-## Example Bot
-
-```python
-import random
-from nashium import RoundState
-
-class Bot:
-    def __init__(self, seed: int | None = None):
-        self.rng = random.Random(seed)
-
-    def move(self, state: RoundState) -> int:
-        if state.round_index == 0:
-            return self.rng.choice([0, 1])
-        return state.opponent_history[-1]
-```
-
----
-
-## RoundState Fields
-
-- `state.round_index`
-- `state.my_history`
-- `state.opponent_history`
-
----
-
-## Time Limit Behavior
-
-Each bot has a **100 second total** time budget.
-
-If exceeded:
-
-- The match continues
-- The bot defaults to returning `0`
-- This almost always results in a loss
-
-The same default-to-`0` behavior applies when a bot exceeds the memory limit in `--sandbox` / `--docker`.
-
----
-
-## Reproducibility
-
-```bash
-nashium run bot_a.py bot_b.py
-# ℹ Using random seed: 1234567890
-
-nashium run bot_a.py bot_b.py --seed 1234567890
-```
-
----
-
-## Disclaimer
-
-Local qualification is indicative only.
-
-Server results may differ due to:
-
-- Different seeds
-- Hardware differences
-- Execution timing
-
-Run multiple tests for confidence.
+1. Worker polls server for next queued interaction
+2. Retrieves bot code for both submitted and leaderboard bots
+3. Validates bot code syntax
+4. Generates deterministic seed from bot codes and secret
+5. Executes match in Docker containers with resource limits
+6. Collects runtime statistics (CPU, memory usage)
+7. Submits results to server API

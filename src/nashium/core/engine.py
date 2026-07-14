@@ -3,10 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .executor import BotExecutor
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -22,6 +19,32 @@ class InteractionResult(str, Enum):
     DRAW = "DRAW"
     STAT_DRAW_S_WIN = "STAT_DRAW_S_WIN"
     STAT_DRAW_S_LOSS = "STAT_DRAW_S_LOSS"
+
+
+@runtime_checkable
+class BotExecutor(Protocol):
+    """Protocol for bot execution strategies."""
+
+    def get_move(self, state: "RoundState") -> int:
+        """Get the bot's move for the given state. Returns 0 if timed out."""
+        ...
+
+    @property
+    def elapsed_time(self) -> float:
+        """Total time spent by the bot computing moves."""
+        ...
+
+    @property
+    def timed_out(self) -> bool:
+        """Whether the bot has exceeded its time limit."""
+        ...
+
+    def close(self) -> None:
+        """Clean up any resources."""
+        ...
+
+    def __enter__(self) -> "BotExecutor": ...
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -84,8 +107,8 @@ def _compute_result(submitted_wins: int, config: MatchConfig) -> tuple[Interacti
 
 
 def _play_rounds_with_executors(
-    submitted_executor: "BotExecutor",
-    leaderboard_executor: "BotExecutor",
+    submitted_executor: BotExecutor,
+    leaderboard_executor: BotExecutor,
     config: MatchConfig,
     *,
     capture_histories: bool,
@@ -126,8 +149,8 @@ def _play_rounds_with_executors(
 def _build_summary(
     submitted_wins: int,
     config: MatchConfig,
-    submitted_executor: "BotExecutor",
-    leaderboard_executor: "BotExecutor",
+    submitted_executor: BotExecutor,
+    leaderboard_executor: BotExecutor,
     wall_time: float,
 ) -> MatchSummary:
     """Build a MatchSummary from match results."""
@@ -149,8 +172,8 @@ def _build_summary(
 
 
 def run_match_with_executors(
-    submitted_executor: "BotExecutor",
-    leaderboard_executor: "BotExecutor",
+    submitted_executor: BotExecutor,
+    leaderboard_executor: BotExecutor,
     config: MatchConfig,
 ) -> MatchSummary:
     """Run a match using pre-configured executors.
@@ -170,8 +193,8 @@ def run_match_with_executors(
 
 
 def run_match_trace_with_executors(
-    submitted_executor: "BotExecutor",
-    leaderboard_executor: "BotExecutor",
+    submitted_executor: BotExecutor,
+    leaderboard_executor: BotExecutor,
     config: MatchConfig,
 ) -> MatchTrace:
     """Run a match with full trace using pre-configured executors."""
@@ -192,30 +215,3 @@ def run_match_trace_with_executors(
         leaderboard_moves_raw=l_raw or (),
         leaderboard_moves_effective=l_eff or (),
     )
-
-
-# Backward-compatible convenience functions
-def run_match(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchSummary:
-    """Run a match between two bot objects.
-
-    Convenience function for local testing with trusted code.
-    For sandboxed execution, use run_match_with_executors().
-    """
-    from .executor import LocalExecutor
-
-    with LocalExecutor(submitted_bot, config.max_total_time_seconds_per_bot) as sub:
-        with LocalExecutor(leaderboard_bot, config.max_total_time_seconds_per_bot) as lb:
-            return run_match_with_executors(sub, lb, config)
-
-
-def run_match_trace(submitted_bot, leaderboard_bot, config: MatchConfig) -> MatchTrace:
-    """Run a match with full trace between two bot objects.
-
-    Convenience function for local testing with trusted code.
-    For sandboxed execution, use run_match_trace_with_executors().
-    """
-    from .executor import LocalExecutor
-
-    with LocalExecutor(submitted_bot, config.max_total_time_seconds_per_bot) as sub:
-        with LocalExecutor(leaderboard_bot, config.max_total_time_seconds_per_bot) as lb:
-            return run_match_trace_with_executors(sub, lb, config)

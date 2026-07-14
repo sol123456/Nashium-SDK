@@ -9,10 +9,14 @@ import tempfile
 import shutil
 import threading
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
+from nashium.core.engine import MatchConfig, MatchSummary, MatchTrace, InteractionResult
+from nashium.core.match_result import MatchResult, RuntimeStats, build_derived_match_data
 
 try:
     import docker
@@ -625,3 +629,258 @@ class DockerExecutor:
 
     def __exit__(self, *_):
         self.close()
+
+
+class Backend(ABC):
+    """Abstract backend for bot execution."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable backend name."""
+        ...
+
+    @abstractmethod
+    def run_match_result_between_files(
+        self,
+        path_a: Path,
+        path_b: Path,
+        seed: int,
+        config: MatchConfig,
+        capture_history: bool = False,
+    ) -> MatchResult:
+        ...
+
+
+class DockerBackend(Backend):
+    """Docker container isolation (slow, full isolation)."""
+
+    def __init__(self):
+        super().__init__()
+        self._validate_docker()
+
+    def _validate_docker(self) -> None:
+        """Validate Docker is available and properly configured."""
+        if not DOCKER_AVAILABLE:
+            raise RuntimeError(
+                "Docker backend requires 'docker' package.\n"
+                "Install with: pip install docker"
+            )
+
+        try:
+            client = docker.from_env()
+            client.ping()
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot connect to Docker daemon. Is Docker running?\n"
+                f"Error: {e}"
+            )
+
+        config = DockerConfig()
+        try:
+            client.images.get(config.image)
+        except docker.errors.ImageNotFound:
+            raise RuntimeError(
+                f"Docker image '{config.image}' not found.\n"
+                f"Build with: docker build -t {config.image} src/nashium/server/"
+            )
+
+    @property
+    def name(self) -> str:
+        return "docker container"
+
+    def _run_match_result_internal(
+        self,
+        submitted_source: str,
+        opponent_source: str,
+        seed: int,
+        config: MatchConfig,
+        capture_history: bool,
+    ) -> MatchResult:
+        start = time.perf_counter()
+
+        with DockerExecutor(
+            submitted_source,
+            time_limit=config.max_total_time_seconds_per_bot,
+            seed=seed,
+            config=DockerConfig(memory_limit=(config.max_total_memory_bytes_per_bot or "200m")),
+        ) as submitted:
+            with DockerExecutor(
+                opponent_source,
+                time_limit=config.max_total_time_seconds_per_bot,
+                seed=seed,
+                config=DockerConfig(memory_limit=(config.max_total_memory_bytes_per_bot or "200m")),
+            ) as opponent:
+                submitted_wins = 0
+                last_submitted_move: int | None = None
+                last_opponent_effective: int | None = None
+                rounds_played = 0
+
+                if capture_history:
+                    submitted_history: list[int] = []
+                    opponent_raw_history: list[int] = []
+                    opponent_effective_history: list[int] = []
+                    submitted_cpu_usage_samples: list[int] = []
+                    submitted_ram_usage_samples: list[int] = []
+                    opponent_cpu_usage_samples: list[int] = []
+                    opponent_ram_usage_samples: list[int] = []
+
+                    sample_interval = max(1, int(config.rounds * 0.005))
+
+                for _ in range(config.rounds):
+                    s_move = submitted.get_move(last_opponent_effective)
+                    o_move_raw = opponent.get_move(last_submitted_move)
+                    o_move = 1 - o_move_raw
+
+                    if s_move == o_move:
+                        submitted_wins += 1
+
+                    if capture_history:
+                        submitted_history.append(s_move)
+                        opponent_raw_history.append(o_move_raw)
+                        opponent_effective_history.append(o_move)
+
+                    last_submitted_move = s_move
+                    last_opponent_effective = o_move
+                    rounds_played += 1
+
+                    if capture_history and (
+                            rounds_played % sample_interval == 0
+                            or rounds_played == config.rounds
+                    ):
+                        for ex in (submitted, opponent):
+                            poll = getattr(ex, "poll_usage", None)
+                            if callable(poll):
+                                poll()
+
+                        time_budget = config.max_total_time_seconds_per_bot
+                        mem_budget = config.max_total_memory_bytes_per_bot
+
+                        sub_cpu_frac = (submitted.elapsed_time / time_budget) if time_budget else 0.0
+                        sub_cpu_scaled = int(max(0.0, min(1.0, sub_cpu_frac)) * 1000)
+                        submitted_cpu_usage_samples.append(sub_cpu_scaled)
+
+                        opp_cpu_frac = (opponent.elapsed_time / time_budget) if time_budget else 0.0
+                        opp_cpu_scaled = int(max(0.0, min(1.0, opp_cpu_frac)) * 1000)
+                        opponent_cpu_usage_samples.append(opp_cpu_scaled)
+
+                        sub_mem_current = getattr(submitted, "memory_bytes_current", None)
+                        if sub_mem_current is None:
+                            sub_mem_current = getattr(submitted, "memory_bytes_peak", None)
+
+                        if mem_budget and sub_mem_current is not None:
+                            sub_mem_frac = sub_mem_current / mem_budget
+                            sub_mem_scaled = int(max(0.0, min(1.0, sub_mem_frac)) * 1000)
+                        else:
+                            sub_mem_scaled = 0
+                        submitted_ram_usage_samples.append(sub_mem_scaled)
+
+                        opp_mem_current = getattr(opponent, "memory_bytes_current", None)
+                        if opp_mem_current is None:
+                            opp_mem_current = getattr(opponent, "memory_bytes_peak", None)
+
+                        if mem_budget and opp_mem_current is not None:
+                            opp_mem_frac = opp_mem_current / mem_budget
+                            opp_mem_scaled = int(max(0.0, min(1.0, opp_mem_frac)) * 1000)
+                        else:
+                            opp_mem_scaled = 0
+                        opponent_ram_usage_samples.append(opp_mem_scaled)
+
+                wall_time = time.perf_counter() - start
+
+                for ex in (submitted, opponent):
+                    poll = getattr(ex, "poll_usage", None)
+                    if callable(poll):
+                        poll()
+
+                # Check for errors (distinct from timeouts)
+                submitted_errored = getattr(submitted, 'errored', False)
+                opponent_errored = getattr(opponent, 'errored', False)
+
+                stat_sig = (
+                        submitted_wins >= config.stat_sig_win_threshold
+                        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
+                )
+
+                if submitted_wins >= config.stat_sig_win_threshold:
+                    result = InteractionResult.S_WIN
+                elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
+                    result = InteractionResult.S_LOSS
+                elif submitted_wins == config.rounds // 2:
+                    result = InteractionResult.DRAW
+                elif submitted_wins > config.rounds // 2:
+                    result = InteractionResult.STAT_DRAW_S_WIN
+                else:
+                    result = InteractionResult.STAT_DRAW_S_LOSS
+
+                submitted_stats = RuntimeStats(
+                    elapsed_time_seconds=submitted.elapsed_time,
+                    timed_out=submitted.timed_out,
+                    memory_exceeded=getattr(submitted, "memory_exceeded", False),
+                    errored=bool(submitted_errored),
+                    error_message=getattr(submitted, "error_message", None),
+                    memory_bytes_peak=getattr(submitted, "memory_bytes_peak", None),
+                    cpu_usage_samples=tuple(submitted_cpu_usage_samples) if capture_history else (),
+                    ram_usage_samples=tuple(submitted_ram_usage_samples) if capture_history else (),
+                )
+
+                opponent_stats = RuntimeStats(
+                    elapsed_time_seconds=opponent.elapsed_time,
+                    timed_out=opponent.timed_out,
+                    memory_exceeded=getattr(opponent, "memory_exceeded", False),
+                    errored=bool(opponent_errored),
+                    error_message=getattr(opponent, "error_message", None),
+                    memory_bytes_peak=getattr(opponent, "memory_bytes_peak", None),
+                    cpu_usage_samples=tuple(opponent_cpu_usage_samples) if capture_history else (),
+                    ram_usage_samples=tuple(opponent_ram_usage_samples) if capture_history else (),
+                )
+
+                submitted_moves_t = tuple(submitted_history) if capture_history else ()
+                opponent_raw_t = tuple(opponent_raw_history) if capture_history else ()
+                opponent_eff_t = tuple(opponent_effective_history) if capture_history else ()
+
+                score_per_round: tuple[int, ...] = ()
+                leaderboard_output_deduced: tuple[int, ...] = ()
+                s_bot_stats = None
+                o_bot_stats = None
+                if capture_history:
+                    score_per_round, leaderboard_output_deduced, s_bot_stats, o_bot_stats = build_derived_match_data(
+                        submitted_moves=submitted_moves_t,
+                        leaderboard_moves_effective=opponent_eff_t,
+                    )
+
+                match_result = MatchResult(
+                    seed=seed,
+                    config=config,
+                    rounds=config.rounds,
+                    submitted_wins=submitted_wins,
+                    submitted_win_rate=submitted_wins / config.rounds if config.rounds else 0.0,
+                    result=result,
+                    stat_sig=stat_sig,
+                    submitted=submitted_stats,
+                    leaderboard=opponent_stats,
+                    wall_time_seconds=wall_time,
+                    submitted_moves=submitted_moves_t,
+                    leaderboard_moves_raw=opponent_raw_t,
+                    leaderboard_moves_effective=opponent_eff_t,
+                    submitted_performance=score_per_round,
+                    leaderboard_output_deduced=leaderboard_output_deduced,
+                    submitted_stats=s_bot_stats,
+                    leaderboard_stats=o_bot_stats,
+                )
+
+                return match_result
+
+    def run_match_result_between_files(
+        self,
+        path_a: Path,
+        path_b: Path,
+        seed: int,
+        config: MatchConfig,
+        capture_history: bool = False,
+    ) -> MatchResult:
+        source_a = path_a.read_text()
+        source_b = path_b.read_text()
+        return self._run_match_result_internal(
+            source_a, source_b, seed, config, capture_history=capture_history
+        )
