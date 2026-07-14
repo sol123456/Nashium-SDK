@@ -1,0 +1,3 @@
+[console_scripts]
+nashium = nashium.cli:main
+nashium-worker = nashium.worker.main:main
