@@ -81,11 +81,11 @@ Example:
         help="Worker authentication token (required)",
     )
 
-    parser.add_argument(
-        "--seed-secret",
-        default=os.environ.get("NASHIUM_SEED_SECRET", ""),
-        help="Secret key for seed generation (required)",
-    )
+    # parser.add_argument(
+    #     "--seed-secret",
+    #     default=os.environ.get("NASHIUM_SEED_SECRET", ""),
+    #     help="Secret key for seed generation (required)",
+    # )
 
     parser.add_argument(
         "--rounds",
@@ -154,10 +154,10 @@ Example:
         print("Provide via --token or NASHIUM_WORKER_TOKEN environment variable")
         sys.exit(1)
 
-    if not args.seed_secret:
-        print("Error: Seed secret is required")
-        print("Provide via --seed-secret or NASHIUM_SEED_SECRET environment variable")
-        sys.exit(1)
+    # if not args.seed_secret:
+    #     print("Error: Seed secret is required")
+    #     print("Provide via --seed-secret or NASHIUM_SEED_SECRET environment variable")
+    #     sys.exit(1)
 
     # Import here to avoid circular imports and speed up --help
     from .runner import Worker, WorkerConfig
@@ -165,7 +165,7 @@ Example:
     config = WorkerConfig(
         api_base_url=api_url,
         worker_token=args.token,
-        seed_secret=args.seed_secret,
+        # seed_secret=args.seed_secret,
         rounds=args.rounds,
         max_time_per_bot=args.max_time,
         poll_interval_seconds=args.poll_interval,

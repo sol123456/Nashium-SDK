@@ -52,7 +52,7 @@ class WorkerConfig:
     worker_token: str = ""
 
     # Seed generation secret (REQUIRED - must match server config)
-    seed_secret: str = ""
+    # seed_secret: str = ""
 
     # Match config
     rounds: int = 10_000
@@ -185,8 +185,8 @@ class Worker:
         self._consecutive_errors = 0
 
         # Validate required config
-        if not config.seed_secret:
-            raise ValueError("seed_secret is required in WorkerConfig")
+        # if not config.seed_secret:
+        #     raise ValueError("seed_secret is required in WorkerConfig")
 
         # Setup logging
         logging.basicConfig(
@@ -204,13 +204,13 @@ class Worker:
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
-    def _generate_seed(self, submitted_code: str, leaderboard_code: str) -> int:
-        """Generate a secure deterministic seed for this match."""
-        return generate_match_seed(
-            submitted_code=submitted_code,
-            leaderboard_code=leaderboard_code,
-            secret_key=self.config.seed_secret,
-        )
+    # def _generate_seed(self, submitted_code: str, leaderboard_code: str) -> int:
+    #     """Generate a secure deterministic seed for this match."""
+    #     return generate_match_seed(
+    #         submitted_code=submitted_code,
+    #         leaderboard_code=leaderboard_code,
+    #         secret_key=self.config.seed_secret,
+    #     )
 
     def run_single(self) -> bool:
         """
@@ -272,11 +272,18 @@ class Worker:
                 f"- replacing with default (all 0s)"
             )
 
-        # 5. Generate seed from ORIGINAL code (before any replacements)
-        # This ensures the seed is consistent regardless of whether we replaced code
-        seed = self._generate_seed(original_submitted, original_leaderboard)
-        seed = seed & 0x7FFFFFFF  # Mask to fit in signed 32-bit integer (0 to 2,147,483,647)
-        logger.info(f"Generated seed: {seed}")
+            # 5. Extract seed provided by the backend server
+            if interaction.seed is None:
+                logger.error(f"Server did not provide a seed for interaction {interaction.id}")
+                # Depending on how you want to handle this, you can return False
+                # or generate a random fallback. Let's return False to skip the broken match.
+                return False
+
+            seed = interaction.seed
+            logger.info(f"Using server-provided seed: {seed}")
+
+            # 6. Run the match
+            logger.info(f"Running match ({self.config.rounds} rounds)...")
 
         # 6. Run the match
         logger.info(f"Running match ({self.config.rounds} rounds)...")

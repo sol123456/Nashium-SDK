@@ -1,4 +1,4 @@
-"""
+""" THIS FILE IS DEFUNCT
 Cryptographically secure deterministic seed generation.
 
 The seed is:
