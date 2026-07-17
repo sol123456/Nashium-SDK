@@ -138,7 +138,7 @@ def _match_result_to_submission(
     return MatchResultSubmissionDTO(
         interactionId=interaction_id,
         seed=result.seed,
-        result=result.result.value,
+        submitted_wins=result.submitted_wins,
         submitted=_build_runtime_stats_dto(
             result.submitted,
             result.submitted_stats,
@@ -300,7 +300,6 @@ class Worker:
         elapsed = time.perf_counter() - start_time
         logger.info(
             f"Match completed in {elapsed:.2f}s: "
-            f"result={result.result.value}, "
             f"submitted_wins={result.submitted_wins}/{result.rounds}"
         )
 

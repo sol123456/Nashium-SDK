@@ -1,5 +1,4 @@
 from .engine import (
-    InteractionResult,
     MatchConfig,
     MatchSummary,
     MatchTrace,
@@ -24,7 +23,6 @@ __all__ = [
     "MatchSummary",
     "MatchTrace",
     "MatchResult",
-    "InteractionResult",
     # Match runners
     "run_match_with_executors",
     "run_match_trace_with_executors",

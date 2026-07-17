@@ -7,12 +7,10 @@ __all__ = [
     "RuntimeStats",
     "BotStats",
     "DefaultReason",
-    "InteractionResult",
     "run_match_result_from_code_strings",
 ]
 
 from nashium.core.engine import (
-    InteractionResult,
     MatchConfig,
     MatchSummary,
     MatchTrace,

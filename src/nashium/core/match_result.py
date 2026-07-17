@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from .engine import InteractionResult, MatchConfig, MatchSummary, MatchTrace
+from .engine import MatchConfig, MatchSummary, MatchTrace
 
 
 DefaultReason = Literal["cpu", "ram", "error"]
@@ -103,8 +103,6 @@ class MatchResult:
     rounds: int
     submitted_wins: int
     submitted_win_rate: float
-    result: InteractionResult
-    stat_sig: bool
 
     submitted: RuntimeStats
     leaderboard: RuntimeStats
@@ -126,8 +124,6 @@ class MatchResult:
             rounds=self.rounds,
             submitted_wins=self.submitted_wins,
             submitted_win_rate=self.submitted_win_rate,
-            result=self.result,
-            stat_sig=self.stat_sig,
             submitted_time_seconds=self.submitted.elapsed_time_seconds,
             leaderboard_time_seconds=self.leaderboard.elapsed_time_seconds,
             wall_time_seconds=self.wall_time_seconds,

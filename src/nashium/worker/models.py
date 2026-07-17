@@ -75,6 +75,6 @@ class MatchResultSubmissionDTO(BaseModel):
     """Matches com.nashium.myapp.service.dto.workerDTOs.MatchResultSubmissionDTO"""
     interactionId: int
     seed: int
-    result: str  # "S_LOSS", "S_WIN", "DRAW", "STAT_DRAW_S_WIN", "STAT_DRAW_S_LOSS"
+    submitted_wins: int
     submitted: RuntimeStatsSubmissionDTO
     leaderboard: RuntimeStatsSubmissionDTO

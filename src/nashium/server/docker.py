@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import List
 
 from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
-from nashium.core.engine import MatchConfig, MatchSummary, MatchTrace, InteractionResult
+from nashium.core.engine import MatchConfig, MatchSummary, MatchTrace
 from nashium.core.match_result import MatchResult, RuntimeStats, build_derived_match_data
 
 try:
@@ -791,22 +791,6 @@ class DockerBackend(Backend):
                 submitted_errored = getattr(submitted, 'errored', False)
                 opponent_errored = getattr(opponent, 'errored', False)
 
-                stat_sig = (
-                        submitted_wins >= config.stat_sig_win_threshold
-                        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
-                )
-
-                if submitted_wins >= config.stat_sig_win_threshold:
-                    result = InteractionResult.S_WIN
-                elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
-                    result = InteractionResult.S_LOSS
-                elif submitted_wins == config.rounds // 2:
-                    result = InteractionResult.DRAW
-                elif submitted_wins > config.rounds // 2:
-                    result = InteractionResult.STAT_DRAW_S_WIN
-                else:
-                    result = InteractionResult.STAT_DRAW_S_LOSS
-
                 submitted_stats = RuntimeStats(
                     elapsed_time_seconds=submitted.elapsed_time,
                     timed_out=submitted.timed_out,
@@ -849,8 +833,6 @@ class DockerBackend(Backend):
                     rounds=config.rounds,
                     submitted_wins=submitted_wins,
                     submitted_win_rate=submitted_wins / config.rounds if config.rounds else 0.0,
-                    result=result,
-                    stat_sig=stat_sig,
                     submitted=submitted_stats,
                     leaderboard=opponent_stats,
                     wall_time_seconds=wall_time,

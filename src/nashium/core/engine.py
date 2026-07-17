@@ -13,12 +13,6 @@ class RoundState:
     opponent_history: tuple[int, ...]
 
 
-class InteractionResult(str, Enum):
-    S_LOSS = "S_LOSS"
-    S_WIN = "S_WIN"
-    DRAW = "DRAW"
-    STAT_DRAW_S_WIN = "STAT_DRAW_S_WIN"
-    STAT_DRAW_S_LOSS = "STAT_DRAW_S_LOSS"
 
 
 @runtime_checkable
@@ -60,8 +54,6 @@ class MatchSummary:
     rounds: int
     submitted_wins: int
     submitted_win_rate: float
-    result: InteractionResult
-    stat_sig: bool
     submitted_time_seconds: float
     leaderboard_time_seconds: float
     wall_time_seconds: float
@@ -85,25 +77,6 @@ class MatchTrace:
     leaderboard_ram_usage_samples: tuple[int, ...] = ()
 
 
-def _compute_result(submitted_wins: int, config: MatchConfig) -> tuple[InteractionResult, bool]:
-    """Compute match result and statistical significance."""
-    stat_sig = (
-        submitted_wins >= config.stat_sig_win_threshold
-        or submitted_wins <= (config.rounds - config.stat_sig_win_threshold)
-    )
-
-    if submitted_wins >= config.stat_sig_win_threshold:
-        result = InteractionResult.S_WIN
-    elif submitted_wins <= (config.rounds - config.stat_sig_win_threshold):
-        result = InteractionResult.S_LOSS
-    elif submitted_wins == config.rounds // 2:
-        result = InteractionResult.DRAW
-    elif submitted_wins > config.rounds // 2:
-        result = InteractionResult.STAT_DRAW_S_WIN
-    else:
-        result = InteractionResult.STAT_DRAW_S_LOSS
-
-    return result, stat_sig
 
 
 def _play_rounds_with_executors(
@@ -154,15 +127,12 @@ def _build_summary(
     wall_time: float,
 ) -> MatchSummary:
     """Build a MatchSummary from match results."""
-    result, stat_sig = _compute_result(submitted_wins, config)
     win_rate = submitted_wins / config.rounds if config.rounds else 0.0
 
     return MatchSummary(
         rounds=config.rounds,
         submitted_wins=submitted_wins,
         submitted_win_rate=win_rate,
-        result=result,
-        stat_sig=stat_sig,
         submitted_time_seconds=submitted_executor.elapsed_time,
         leaderboard_time_seconds=leaderboard_executor.elapsed_time,
         wall_time_seconds=wall_time,
