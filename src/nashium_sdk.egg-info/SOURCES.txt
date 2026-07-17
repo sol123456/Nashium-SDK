@@ -8,9 +8,8 @@ src/nashium/core/errors.py
 src/nashium/core/match_result.py
 src/nashium/core/util.py
 src/nashium/server/__init__.py
-src/nashium/server/_subprocess_runner.py
+src/nashium/server/_docker_runner.py
 src/nashium/server/docker.py
-src/nashium/server/sandbox.py
 src/nashium/worker/__init__.py
 src/nashium/worker/api.py
 src/nashium/worker/client.py

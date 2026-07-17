@@ -689,6 +689,28 @@ class DockerBackend(Backend):
     def name(self) -> str:
         return "docker container"
 
+    def run_match_result_between_files(
+            self,
+            path_a: Path,
+            path_b: Path,
+            seed: int,
+            config: MatchConfig,
+            capture_history: bool = False,
+    ) -> MatchResult:
+        """Satisfy the Backend interface by reading files and executing from strings."""
+        with open(path_a, "r", encoding="utf-8") as f_a:
+            submitted_source = f_a.read()
+        with open(path_b, "r", encoding="utf-8") as f_b:
+            opponent_source = f_b.read()
+
+        return self.run_match_result_from_strings(
+            submitted_source,
+            opponent_source,
+            seed,
+            config,
+            capture_history
+        )
+
     def run_match_result_from_strings(self, submitted_source: str, opponent_source: str, seed: int, config: MatchConfig,
                                       capture_history: bool = False) -> MatchResult:
         start = time.perf_counter()

@@ -240,10 +240,6 @@ class Worker:
         submitted_code = submitted_bot.code or ""
         leaderboard_code = leaderboard_bot.code or ""
 
-        # Keep original code for seed generation
-        original_submitted = submitted_code
-        original_leaderboard = leaderboard_code
-
         # Track if we had to replace either bot
         submitted_errored = False
         leaderboard_errored = False
@@ -272,18 +268,13 @@ class Worker:
                 f"- replacing with default (all 0s)"
             )
 
-            # 5. Extract seed provided by the backend server
-            if interaction.seed is None:
-                logger.error(f"Server did not provide a seed for interaction {interaction.id}")
-                # Depending on how you want to handle this, you can return False
-                # or generate a random fallback. Let's return False to skip the broken match.
-                return False
+        # 5. Extract seed provided by the backend server
+        if interaction.seed is None:
+            logger.error(f"Server did not provide a seed for interaction {interaction.id}")
+            return False
 
-            seed = interaction.seed
-            logger.info(f"Using server-provided seed: {seed}")
-
-            # 6. Run the match
-            logger.info(f"Running match ({self.config.rounds} rounds)...")
+        seed = interaction.seed
+        logger.info(f"Using server-provided seed: {seed}")
 
         # 6. Run the match
         logger.info(f"Running match ({self.config.rounds} rounds)...")
@@ -294,7 +285,7 @@ class Worker:
             leaderboard_code=leaderboard_code,
             seed=seed,
             config=self.match_config,
-            capture_history=True,  # removed sandbox=False, docker=True
+            capture_history=True,
         )
 
         elapsed = time.perf_counter() - start_time
