@@ -169,6 +169,11 @@ def run_socket_mode(sock_path: str):
                     mv, elapsed = runner.make_move(opp_last)
                     socket_send_response(sock, STATUS_OK, mv, elapsed)
                 except Exception:
+                    # Print the error so Docker captures it in the logs
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+
+                    # Continue sending the standard 10-byte error response
                     socket_send_response(sock, STATUS_ERROR, 0, 0.0)
 
     except ConnectionError:

@@ -447,6 +447,19 @@ class DockerExecutor:
             self._elapsed_time += elapsed
             self._errored = True
             self._error_message = f"Bot error (status={status})"
+
+            # "Pick up" the error trace from Docker logs safely
+            try:
+                if self._container:
+                    # tail=50 ensures we only read a safe amount of text, maintaining security
+                    err_logs = self._container.logs(stdout=False, stderr=True, tail=50)
+                    if err_logs:
+                        safe_logs = err_logs.decode('utf-8', errors='replace').strip()
+                        if safe_logs:
+                            self._error_message = f"Bot runtime error:\n{safe_logs}"
+            except Exception:
+                pass # Fallback to the generic error message if logs fail
+
             return 0
 
         self._elapsed_time += elapsed
