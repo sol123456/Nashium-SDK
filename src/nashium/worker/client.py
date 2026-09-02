@@ -82,10 +82,6 @@ class NashiumClient:
             allowed_methods=frozenset(["GET"]),
         )))
 
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
         # Set default headers
         self.session.headers.update({
             "X-Worker-Token": self.worker_token,
