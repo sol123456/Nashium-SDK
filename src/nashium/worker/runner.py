@@ -1,90 +1,106 @@
-"""
-Main worker loop - claims matches, runs them, submits results.
-"""
+"""Worker loop: claim -> execute in Docker -> submit.
 
+Two fault classes, two behaviours:
+
+  Bot fault      (OOM / CPU / crash / bad move / unparseable code)
+                 -> every remaining move defaults to 0, the match completes,
+                    wins count normally, flags are set on the submission.
+
+  Harness fault  (Docker down, stale image, container won't start)
+                 -> submit NOTHING. The interaction stays EXECUTING. The worker
+                    refuses to claim any other work and retries this exact match
+                    every retry_interval_seconds, forever.
+"""
 from __future__ import annotations
 
 import logging
 import signal
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-from .client import NashiumClient, NashiumClientError, AuthenticationError
+from .api import run_match_result_from_code_strings
+from .client import AuthenticationError, NashiumClient, NashiumClientError
 from .models import (
-    NextQueuedInteractionDTO,
     MatchResultSubmissionDTO,
+    NextQueuedInteractionDTO,
     RuntimeStatsSubmissionDTO,
 )
-from .seed import generate_match_seed
-
-# Import from the SDK core
 from ..core.engine import MatchConfig
-from ..core.match_result import MatchResult, RuntimeStats, BotStats
-from .api import run_match_result_from_code_strings
+from ..core.errors import MatchExecutionError
+from ..core.match_result import BotStats, MatchResult, RuntimeStats
+from ..server.docker import (
+    cleanup_stale_containers,
+    cleanup_stale_socket_dirs,
+    reset_client,
+    verify_environment,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Default bot that always returns 0
-DEFAULT_BOT_CODE = '''
-"""Default bot - returns 0 for every move (used when actual bot code is invalid)."""
-
-class Bot:
-    def __init__(self, seed=None):
-        pass
-    
-    def move(self, state):
-        return 0
-
-def create_bot(seed=None):
-    return Bot(seed)
-'''
-
-
 @dataclass
 class WorkerConfig:
-    """Configuration for the worker."""
-
-    # API connection
     api_base_url: str = "http://localhost:8080"
     worker_token: str = ""
 
-    # Seed generation secret (REQUIRED - must match server config)
-    # seed_secret: str = ""
-
-    # Match config
     rounds: int = 10_000
     stat_sig_win_threshold: int = 5155
     max_time_per_bot: float = 100.0
-    max_memory_per_bot: int = 200 * 1024 * 1024  # 200MB default
+    max_wall_per_bot: float = 300.0
+    max_memory_per_bot: int = 200 * 1024 * 1024
 
-    # Worker behavior
-    poll_interval_seconds: float = 2.0
     idle_poll_interval_seconds: float = 10.0
-    max_consecutive_errors: int = 5
-    error_backoff_seconds: float = 30.0
 
-    # Logging
+    # Blocked-match retry cadence. The worker never abandons a claimed match.
+    retry_interval_seconds: float = 30.0
+    # Escalate to ERROR-level logging after this many failed attempts.
+    escalate_after_attempts: int = 4
+
     log_level: str = "INFO"
 
 
-def _is_valid_python(code: str) -> tuple[bool, Optional[str]]:
-    """
-    Check if code is syntactically valid Python.
+@dataclass
+class _Pending:
+    """A claimed interaction the worker is obliged to see through."""
+    claimed: NextQueuedInteractionDTO
+    attempts: int = 0
+    # Set once the match has actually run. Lets us retry a failed *submission*
+    # without re-running an expensive match.
+    submission: Optional[MatchResultSubmissionDTO] = None
+    result: Optional[MatchResult] = None
+    first_failure_at: float = field(default_factory=time.monotonic)
 
-    Returns:
-        (True, None) if valid
-        (False, error_message) if invalid
-    """
-    if not code or not code.strip():
-        return False, "No code provided"
-    try:
-        compile(code, "<bot>", "exec")
-        return True, None
-    except SyntaxError as e:
-        return False, f"SyntaxError: {e}"
+    @property
+    def interaction_id(self) -> int:
+        return self.claimed.interaction.id
+
+
+# --------------------------------------------------------------------- format
+
+def _mb(n: Optional[int]) -> str:
+    return f"{n / (1024 * 1024):.1f}MB" if n else "n/a"
+
+
+def _pct(value: float, budget: float) -> str:
+    return f"{100.0 * value / budget:5.1f}%" if budget else "  n/a"
+
+
+def _health(rs: RuntimeStats) -> str:
+    reason = rs.default_reason
+    if reason is None:
+        return "ok"
+    label = {"ram": "OOM (RAM limit)", "cpu": "TIMEOUT (CPU/wall limit)",
+             "error": "CRASHED"}[reason]
+    frm = rs.default_from_round if rs.default_from_round is not None else 0
+    return f"{label} -> defaulted to 0 from round {frm}"
+
+
+def _condense(text: str, keep: int = 6) -> str:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return " | ".join(lines[-keep:])[:600]
 
 
 def _build_runtime_stats_dto(
@@ -92,26 +108,18 @@ def _build_runtime_stats_dto(
     stats: Optional[BotStats],
     moves: tuple[int, ...],
     performance: tuple[int, ...],
-    override_errored: bool = False,
-    override_error_msg: Optional[str] = None,
 ) -> RuntimeStatsSubmissionDTO:
-    """Convert SDK RuntimeStats + BotStats to the submission DTO."""
-
-    # Use override if provided, otherwise use runtime's values
-    errored = override_errored or runtime.errored
-    error_msg = override_error_msg if override_errored else runtime.error_message
-
     return RuntimeStatsSubmissionDTO(
         timedOut=runtime.timed_out,
         memoryExceeded=runtime.memory_exceeded,
-        errored=errored,
-        errorMessage=error_msg,
+        errored=runtime.errored,
+        errorMessage=runtime.error_message[:2000] if runtime.error_message else None,
         maxMemory=float(runtime.memory_bytes_peak) if runtime.memory_bytes_peak else None,
         endCpuTime=runtime.elapsed_time_seconds,
-        cpuUsageSamples=list(runtime.cpu_usage_samples) if runtime.cpu_usage_samples else None,
-        ramUsageSamples=list(runtime.ram_usage_samples) if runtime.ram_usage_samples else None,
-        moves=list(moves) if moves else None,
-        performance=list(performance) if performance else None,
+        cpuUsageSamples=list(runtime.cpu_usage_samples) or None,
+        ramUsageSamples=list(runtime.ram_usage_samples) or None,
+        moves=list(moves) or None,
+        performance=list(performance) or None,
         wins=stats.wins if stats else None,
         losses=stats.losses if stats else None,
         entropy=stats.entropy if stats else None,
@@ -120,278 +128,294 @@ def _build_runtime_stats_dto(
     )
 
 
-def _match_result_to_submission(
-    interaction_id: int,
-    result: MatchResult,
-    submitted_errored: bool = False,
-    submitted_error_msg: Optional[str] = None,
-    leaderboard_errored: bool = False,
-    leaderboard_error_msg: Optional[str] = None,
-) -> MatchResultSubmissionDTO:
-    """Convert SDK MatchResult to the API submission DTO."""
-
-    # Compute leaderboard's performance (inverse of submitted's score_per_round)
-    # score_per_round: 1 = submitted won, 0 = submitted lost
-    # leaderboard_performance: 1 = leaderboard won, 0 = leaderboard lost
+def _to_submission(interaction_id: int, result: MatchResult) -> MatchResultSubmissionDTO:
     leaderboard_performance = tuple(1 - x for x in result.submitted_performance)
-
     return MatchResultSubmissionDTO(
         interactionId=interaction_id,
         seed=result.seed,
         submitted_wins=result.submitted_wins,
         submitted=_build_runtime_stats_dto(
-            result.submitted,
-            result.submitted_stats,
-            result.submitted_moves,
-            result.submitted_performance,  # Submitted's perspective
-            override_errored=submitted_errored,
-            override_error_msg=submitted_error_msg,
-        ),
+            result.submitted, result.submitted_stats,
+            result.submitted_moves, result.submitted_performance),
         leaderboard=_build_runtime_stats_dto(
-            result.leaderboard,
-            result.leaderboard_stats,
-            result.leaderboard_moves_effective,
-            leaderboard_performance,  # Leaderboard's perspective (computed above)
-            override_errored=leaderboard_errored,
-            override_error_msg=leaderboard_error_msg,
-        ),
+            result.leaderboard, result.leaderboard_stats,
+            result.leaderboard_moves_effective, leaderboard_performance),
     )
 
 
+# ---------------------------------------------------------------------- worker
+
 class Worker:
-    """
-    Main worker class - runs the poll/execute/submit loop.
-
-    Execution settings (hardcoded for security):
-    - sandbox=False (we use Docker instead)
-    - docker=True (containerized execution)
-    - capture_history=True (we need moves for stats)
-    """
-
     def __init__(self, config: WorkerConfig):
         self.config = config
-        self.client = NashiumClient(
-            base_url=config.api_base_url,
-            worker_token=config.worker_token,
-        )
+        self.client = NashiumClient(base_url=config.api_base_url,
+                                    worker_token=config.worker_token)
         self.match_config = MatchConfig(
             rounds=config.rounds,
             stat_sig_win_threshold=config.stat_sig_win_threshold,
             max_total_time_seconds_per_bot=config.max_time_per_bot,
-            max_total_memory_bytes_per_bot=config.max_memory_per_bot or (200 * 1024 * 1024),
+            max_total_memory_bytes_per_bot=config.max_memory_per_bot,
+            max_total_wall_seconds_per_bot=config.max_wall_per_bot,
         )
+        self._pending: Optional[_Pending] = None
+        self._stop = threading.Event()
 
-        self._running = False
-        self._consecutive_errors = 0
-
-        # Validate required config
-        # if not config.seed_secret:
-        #     raise ValueError("seed_secret is required in WorkerConfig")
-
-        # Setup logging
         logging.basicConfig(
             level=getattr(logging, config.log_level.upper()),
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    def _setup_signal_handlers(self):
-        """Setup graceful shutdown handlers."""
-        def handler(signum, frame):
-            logger.info(f"Received signal {signum}, shutting down...")
-            self._running = False
+    # --------------------------------------------------------------- plumbing
 
+    def _sleep(self, seconds: float) -> None:
+        """Interruptible sleep, so SIGTERM does not wait out a 30s backoff."""
+        self._stop.wait(seconds)
+
+    def _setup_signal_handlers(self) -> None:
+        def handler(signum, _frame):
+            logger.info("Signal %s received - finishing current work then stopping",
+                        signum)
+            self._stop.set()
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
-    # def _generate_seed(self, submitted_code: str, leaderboard_code: str) -> int:
-    #     """Generate a secure deterministic seed for this match."""
-    #     return generate_match_seed(
-    #         submitted_code=submitted_code,
-    #         leaderboard_code=leaderboard_code,
-    #         secret_key=self.config.seed_secret,
-    #     )
+    def _blocked(self, pending: _Pending, reason: str) -> None:
+        """Record a harness failure. Submit nothing; hold the match; retry later."""
+        pending.attempts += 1
+        stuck_for = time.monotonic() - pending.first_failure_at
+        level = (logging.ERROR if pending.attempts >= self.config.escalate_after_attempts
+                 else logging.WARNING)
+        logger.log(level,
+                   "BLOCKED on interaction %s (attempt %d, stuck %.0fs): %s",
+                   pending.interaction_id, pending.attempts, stuck_for, reason)
+        logger.log(level,
+                   "  interaction %s stays EXECUTING and no other match will be "
+                   "claimed. Retrying in %.0fs.",
+                   pending.interaction_id, self.config.retry_interval_seconds)
 
-    def run_single(self) -> bool:
-        """
-        Run a single poll/execute/submit cycle.
+        # If the daemon restarted, the pooled client connections are dead.
+        reset_client()
+        try:
+            cleanup_stale_containers()
+        except Exception:  # noqa: BLE001
+            pass
 
-        Returns:
-            True if work was processed, False if no work available.
-        """
-        # 1. Claim next interaction
+    # ---------------------------------------------------------------- logging
+
+    def _log_report(self, pending: _Pending, result: MatchResult,
+                    elapsed: float) -> None:
+        cfg = self.match_config
+        s, l = result.submitted, result.leaderboard
+        sub = pending.claimed.submittedBot.name or f"bot#{pending.claimed.submittedBot.id}"
+        lead = (pending.claimed.leaderboardBot.name
+                or f"bot#{pending.claimed.leaderboardBot.id}")
+        losses = result.rounds - result.submitted_wins
+        overhead = max(0.0, elapsed - s.wall_seconds - l.wall_seconds)
+
+        logger.info("Match %s finished in %.1fs | %s %dW-%dL %s (%.2f%%)",
+                    pending.interaction_id, elapsed, sub,
+                    result.submitted_wins, losses, lead,
+                    result.submitted_win_rate * 100.0)
+        logger.info("  cpu    | %s %6.2fs (%s of %.0fs) | %s %6.2fs (%s of %.0fs)"
+                    " | harness %.1fs",
+                    sub, s.elapsed_time_seconds,
+                    _pct(s.elapsed_time_seconds, cfg.max_total_time_seconds_per_bot),
+                    cfg.max_total_time_seconds_per_bot,
+                    lead, l.elapsed_time_seconds,
+                    _pct(l.elapsed_time_seconds, cfg.max_total_time_seconds_per_bot),
+                    cfg.max_total_time_seconds_per_bot, overhead)
+        logger.info("  ram    | %s %8s peak (%s of %s) | %s %8s peak (%s of %s)",
+                    sub, _mb(s.memory_bytes_peak),
+                    _pct(s.memory_bytes_peak or 0, cfg.max_total_memory_bytes_per_bot),
+                    _mb(cfg.max_total_memory_bytes_per_bot),
+                    lead, _mb(l.memory_bytes_peak),
+                    _pct(l.memory_bytes_peak or 0, cfg.max_total_memory_bytes_per_bot),
+                    _mb(cfg.max_total_memory_bytes_per_bot))
+
+        status = f"  status | {sub}: {_health(s)} | {lead}: {_health(l)}"
+        logger.info(status) if (s.healthy and l.healthy) else logger.warning(status)
+
+        for label, rs in ((sub, s), (lead, l)):
+            if rs.defaulted:
+                logger.warning(
+                    "  fault  | %s played %d real round(s), then defaulted. "
+                    "Result still counts. Cause: %s",
+                    label, rs.rounds_played, _condense(rs.error_message or "unknown"))
+
+        if result.submitted_stats and result.leaderboard_stats:
+            logger.debug("  quant  | %s H=%.4f SR=%+.2f AC=%+.3f "
+                         "| %s H=%.4f SR=%+.2f AC=%+.3f",
+                         sub, result.submitted_stats.entropy or 0.0,
+                         result.submitted_stats.sharpe_ratio or 0.0,
+                         result.submitted_stats.return_autocorrelation or 0.0,
+                         lead, result.leaderboard_stats.entropy or 0.0,
+                         result.leaderboard_stats.sharpe_ratio or 0.0,
+                         result.leaderboard_stats.return_autocorrelation or 0.0)
+
+    # ------------------------------------------------------------------ stages
+
+    def _claim(self) -> Optional[_Pending]:
         logger.debug("Polling for work...")
-        interaction_data = self.client.claim_next_interaction()
+        claimed = self.client.claim_next_interaction()
+        if claimed is None:
+            return None
+        pending = _Pending(claimed=claimed)
+        sub = claimed.submittedBot.name or f"bot#{claimed.submittedBot.id}"
+        lead = claimed.leaderboardBot.name or f"bot#{claimed.leaderboardBot.id}"
+        logger.info("Match %s claimed | %s vs %s | seed=%s | %d rounds",
+                    pending.interaction_id, sub, lead,
+                    claimed.interaction.seed, self.config.rounds)
+        return pending
 
-        if interaction_data is None:
-            logger.debug("No work available")
-            return False
+    def _execute(self, pending: _Pending) -> bool:
+        """Run the match. Returns False if blocked by a harness fault."""
+        interaction = pending.claimed.interaction
 
-        interaction = interaction_data.interaction
-        submitted_bot = interaction_data.submittedBot
-        leaderboard_bot = interaction_data.leaderboardBot
-
-        logger.info(
-            f"Claimed interaction {interaction.id}: "
-            f"{submitted_bot.name} vs {leaderboard_bot.name}"
-        )
-
-        # 2. Get code, defaulting to empty string
-        submitted_code = submitted_bot.code or ""
-        leaderboard_code = leaderboard_bot.code or ""
-
-        # Track if we had to replace either bot
-        submitted_errored = False
-        leaderboard_errored = False
-        submitted_error_msg: Optional[str] = None
-        leaderboard_error_msg: Optional[str] = None
-
-        # 3. Validate submitted bot code
-        valid, error = _is_valid_python(submitted_code)
-        if not valid:
-            submitted_errored = True
-            submitted_error_msg = error
-            submitted_code = DEFAULT_BOT_CODE
-            logger.warning(
-                f"Submitted bot '{submitted_bot.name}' has invalid code: {error} "
-                f"- replacing with default (all 0s)"
-            )
-
-        # 4. Validate leaderboard bot code
-        valid, error = _is_valid_python(leaderboard_code)
-        if not valid:
-            leaderboard_errored = True
-            leaderboard_error_msg = error
-            leaderboard_code = DEFAULT_BOT_CODE
-            logger.warning(
-                f"Leaderboard bot '{leaderboard_bot.name}' has invalid code: {error} "
-                f"- replacing with default (all 0s)"
-            )
-
-        # 5. Extract seed provided by the backend server
         if interaction.seed is None:
-            logger.error(f"Server did not provide a seed for interaction {interaction.id}")
+            # Cannot execute, and must not skip. Block until an operator fixes it.
+            self._blocked(pending,
+                          "server supplied no seed - this needs operator "
+                          "intervention; retrying will not help by itself")
             return False
 
-        seed = interaction.seed
-        logger.info(f"Using server-provided seed: {seed}")
+        # Bot code is passed through verbatim, including a poem. The container
+        # fails to compile it, faults, and defaults to 0 for the whole match.
+        # One code path for every kind of bad bot.
+        submitted_code = pending.claimed.submittedBot.code or ""
+        leaderboard_code = pending.claimed.leaderboardBot.code or ""
 
-        # 6. Run the match
-        logger.info(f"Running match ({self.config.rounds} rounds)...")
-        start_time = time.perf_counter()
+        start = time.perf_counter()
+        try:
+            result = run_match_result_from_code_strings(
+                submitted_code=submitted_code,
+                leaderboard_code=leaderboard_code,
+                seed=interaction.seed,
+                config=self.match_config,
+                capture_history=True,
+            )
+        except MatchExecutionError as e:
+            self._blocked(pending, str(e))
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Unexpected harness failure on interaction %s",
+                             pending.interaction_id)
+            self._blocked(pending, f"{type(e).__name__}: {e}")
+            return False
 
-        result = run_match_result_from_code_strings(
-            submitted_code=submitted_code,
-            leaderboard_code=leaderboard_code,
-            seed=seed,
-            config=self.match_config,
-            capture_history=True,
-        )
-
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            f"Match completed in {elapsed:.2f}s: "
-            f"submitted_wins={result.submitted_wins}/{result.rounds}"
-        )
-
-        # 7. Build submission, including any pre-run errors
-        submission = _match_result_to_submission(
-            interaction.id,
-            result,
-            submitted_errored=submitted_errored,
-            submitted_error_msg=submitted_error_msg,
-            leaderboard_errored=leaderboard_errored,
-            leaderboard_error_msg=leaderboard_error_msg,
-        )
-
-        # 8. Submit results
-        logger.info(f"Submitting results for interaction {interaction.id}...")
-        updated = self.client.submit_result(submission)
-
-        logger.info(
-            f"Successfully submitted interaction {updated.id}, "
-            f"status: {updated.status}, result: {updated.result}"
-        )
-
+        elapsed = time.perf_counter() - start
+        self._log_report(pending, result, elapsed)
+        pending.result = result
+        pending.submission = _to_submission(pending.interaction_id, result)
         return True
 
-    def run_forever(self):
-        """
-        Run the worker loop indefinitely until stopped.
-        """
-        self._running = True
+    def _submit(self, pending: _Pending) -> bool:
+        try:
+            updated = self.client.submit_result(pending.submission)
+        except AuthenticationError:
+            raise
+        except NashiumClientError as e:
+            self._blocked(pending,
+                          f"could not submit the completed result: {e} "
+                          f"(the match will NOT be re-run)")
+            return False
+        logger.info("Match %s submitted | status=%s result=%s",
+                    updated.id, updated.status, updated.result)
+        return True
+
+    # -------------------------------------------------------------------- run
+
+    def run_single(self) -> bool:
+        """One claim/execute/submit cycle. Raises on harness failure (test mode)."""
+        pending = self._claim()
+        if pending is None:
+            return False
+        if not self._execute(pending):
+            raise MatchExecutionError(
+                f"Could not execute interaction {pending.interaction_id}")
+        self._submit(pending)
+        return True
+
+    def run_forever(self) -> None:
         self._setup_signal_handlers()
 
-        logger.info("=" * 60)
+        logger.info("=" * 74)
         logger.info("Nashium Worker starting")
-        logger.info(f"  API URL: {self.config.api_base_url}")
-        logger.info(f"  Execution: Docker (sandboxed)")
-        logger.info(f"  Rounds per match: {self.config.rounds}")
-        logger.info(f"  Max time per bot: {self.config.max_time_per_bot}s")
-        logger.info("=" * 60)
+        logger.info("  API URL          : %s", self.config.api_base_url)
+        logger.info("  Execution        : Docker (sandboxed; the only supported mode)")
+        logger.info("  Rounds per match : %d", self.config.rounds)
+        logger.info("  CPU budget / bot : %.0fs (wall guard %.0fs)",
+                    self.config.max_time_per_bot, self.config.max_wall_per_bot)
+        logger.info("  RAM budget / bot : %s", _mb(self.config.max_memory_per_bot))
+        logger.info("  Bot faults       : default to move 0, match still scored")
+        logger.info("  Harness faults   : block and retry every %.0fs, never skip",
+                    self.config.retry_interval_seconds)
+        logger.info("=" * 74)
 
-        # Health check
-        if not self.client.health_check():
-            logger.error(f"Cannot reach server at {self.config.api_base_url}")
-            logger.error("Please check the API URL and ensure the server is running")
-            sys.exit(1)
-
-        logger.info("Server connection verified")
-
-        while self._running:
+        while not self._stop.is_set():
             try:
-                did_work = self.run_single()
-                self._consecutive_errors = 0
+                verify_environment()
+                break
+            except MatchExecutionError as e:
+                logger.error("Docker preflight failed: %s", e)
+                logger.error("Retrying preflight in %.0fs.",
+                             self.config.retry_interval_seconds)
+                reset_client()
+                self._sleep(self.config.retry_interval_seconds)
+        if self._stop.is_set():
+            return
 
-                if did_work:
-                    # Immediately check for more work
-                    time.sleep(0.1)
-                else:
-                    # No work - use longer idle interval
-                    logger.debug(
-                        f"Sleeping {self.config.idle_poll_interval_seconds}s (idle)..."
-                    )
-                    time.sleep(self.config.idle_poll_interval_seconds)
+        cleanup_stale_containers()
+        cleanup_stale_socket_dirs()
+
+        while not self._stop.is_set():
+            try:
+                if self._pending is None:
+                    self._pending = self._claim()
+                    if self._pending is None:
+                        self._sleep(self.config.idle_poll_interval_seconds)
+                        continue
+
+                pending = self._pending
+
+                if pending.submission is None:
+                    if not self._execute(pending):
+                        self._sleep(self.config.retry_interval_seconds)
+                        continue
+
+                if not self._submit(pending):
+                    self._sleep(self.config.retry_interval_seconds)
+                    continue
+
+                self._pending = None
+                self._sleep(0.1)
 
             except AuthenticationError as e:
-                logger.error(f"Authentication failed: {e}")
-                logger.error("Please check your worker token")
-                self._running = False
-                sys.exit(1)
+                logger.error("Authentication failed: %s", e)
+                logger.error("The worker token is wrong or revoked. Stopping.")
+                break
 
             except NashiumClientError as e:
-                self._consecutive_errors += 1
-                logger.error(f"Client error ({self._consecutive_errors}): {e}")
+                # The server being unreachable is never a reason to give up.
+                logger.warning("Server unreachable (%s). Retrying in %.0fs.",
+                               e, self.config.retry_interval_seconds)
+                self._sleep(self.config.retry_interval_seconds)
 
-                if self._consecutive_errors >= self.config.max_consecutive_errors:
-                    logger.error(
-                        f"Too many consecutive errors "
-                        f"({self._consecutive_errors}), stopping"
-                    )
-                    self._running = False
-                    sys.exit(1)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Unexpected worker error: %s", e)
+                self._sleep(self.config.retry_interval_seconds)
 
-                logger.info(f"Backing off for {self.config.error_backoff_seconds}s...")
-                time.sleep(self.config.error_backoff_seconds)
+        if self._pending is not None:
+            logger.warning("=" * 74)
+            logger.warning("Stopping with interaction %s still incomplete.",
+                           self._pending.interaction_id)
+            logger.warning("It remains EXECUTING server-side and was NOT scored. "
+                           "It will need requeueing or another worker.")
+            logger.warning("=" * 74)
 
-            except KeyboardInterrupt:
-                logger.info("Interrupted by user")
-                self._running = False
-
-            except Exception as e:
-                self._consecutive_errors += 1
-                logger.exception(f"Unexpected error ({self._consecutive_errors}): {e}")
-
-                if self._consecutive_errors >= self.config.max_consecutive_errors:
-                    logger.error("Too many errors, stopping")
-                    self._running = False
-                    sys.exit(1)
-
-                time.sleep(self.config.error_backoff_seconds)
-
-        logger.info("Worker stopped")
+        cleanup_stale_containers()
         self.client.close()
+        logger.info("Worker stopped")
 
-    def stop(self):
-        """Signal the worker to stop."""
-        self._running = False
+    def stop(self) -> None:
+        self._stop.set()

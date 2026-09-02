@@ -1,22 +1,23 @@
+from nashium.core import (
+    BotStats,
+    DefaultReason,
+    MatchConfig,
+    MatchExecutionError,
+    MatchResult,
+    NashiumError,
+    RoundState,
+    RuntimeStats,
+)
+
 __all__ = [
     "RoundState",
     "MatchConfig",
-    "MatchSummary",
-    "MatchTrace",
     "MatchResult",
     "RuntimeStats",
     "BotStats",
     "DefaultReason",
-    "run_match_result_from_code_strings",
+    "NashiumError",
+    "MatchExecutionError",
 ]
 
-from nashium.core.engine import (
-    MatchConfig,
-    MatchSummary,
-    MatchTrace,
-    RoundState,
-)
-from nashium.core.match_result import BotStats, DefaultReason, MatchResult, RuntimeStats
-from nashium.worker.api import run_match_result_from_code_strings
-
-__version__ = "0.1.0"
+__version__ = "0.2.0"

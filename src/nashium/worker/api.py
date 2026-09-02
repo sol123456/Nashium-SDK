@@ -1,31 +1,27 @@
 from __future__ import annotations
 
-from nashium.core.engine import MatchConfig
-from nashium.core.match_result import MatchResult
-from nashium.core.util import stable_seed
-from nashium.server.docker import DockerBackend
+from ..core.engine import MatchConfig
+from ..core.match_result import MatchResult
+from ..server.docker import DockerConfig, run_match
 
 
 def run_match_result_from_code_strings(
-        submitted_code: str,
-        leaderboard_code: str,
-        *,
-        seed: int | None = None,
-        config: MatchConfig | None = None,
-        capture_history: bool = True,
+    submitted_code: str,
+    leaderboard_code: str,
+    *,
+    seed: int,
+    config: MatchConfig,
+    capture_history: bool = True,
 ) -> MatchResult:
-    if config is None:
-        config = MatchConfig()
-
+    """Run a match in Docker. Seeds are always supplied by the server."""
     if seed is None:
-        seed = stable_seed(submitted_code.encode("utf-8"), leaderboard_code.encode("utf-8"))
+        raise ValueError("seed is required and must come from the server")
 
-    # Pass strings directly to Docker via the backend
-    backend = DockerBackend()
-    return backend.run_match_result_from_strings(
-        submitted_code,
-        leaderboard_code,
-        seed,
-        config,
+    return run_match(
+        submitted_code=submitted_code,
+        leaderboard_code=leaderboard_code,
+        seed=seed,
+        config=config,
+        docker_config=DockerConfig(memory_limit=config.max_total_memory_bytes_per_bot),
         capture_history=capture_history,
     )

@@ -2,24 +2,13 @@ class NashiumError(Exception):
     pass
 
 
+class MatchExecutionError(NashiumError):
+    """Harness/infrastructure failure (Docker down, image missing, container broken).
+
+    NOT used for bot faults - those are recorded on RuntimeStats instead so the
+    match still produces a submittable result.
+    """
+
+
 class BotLoadError(NashiumError):
-    pass
-
-
-class BotTimeoutError(NashiumError):
-    pass
-
-
-class InvalidMoveError(NashiumError):
-    pass
-
-
-class BotRuntimeError(NashiumError):
-    """Wraps errors that occur during bot execution with location info."""
-    def __init__(self, message: str, original_error: Exception,
-                 filename: str = None, lineno: int = None, line_text: str = None):
-        super().__init__(message)
-        self.original_error = original_error
-        self.filename = filename
-        self.lineno = lineno
-        self.line_text = line_text
+    """Kept for compatibility; bot load failures are normally recorded, not raised."""

@@ -1,311 +1,376 @@
-# docker.py
+"""Docker-sandboxed match execution. The only supported execution mode.
+
+Fault model
+-----------
+Bot faults  (load failure, crash, bad move, CPU/wall timeout, OOM) are RECORDED.
+            The executor defaults to move 0 for every remaining round and the
+            match completes normally. Never raises.
+
+Harness faults (no daemon, missing/stale image, container won't start) RAISE
+            MatchExecutionError. The caller must treat these as blocking: submit
+            nothing and retry the same match later.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import os
+import shutil
 import socket
 import struct
 import tempfile
-import shutil
 import threading
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List
+import uuid
+from dataclasses import dataclass
 
-from nashium.core.errors import BotLoadError, BotRuntimeError, InvalidMoveError
-from nashium.core.engine import MatchConfig, MatchSummary, MatchTrace
+import docker
+from docker.errors import ImageNotFound
+
+from nashium.core.engine import MatchConfig
+from nashium.core.errors import MatchExecutionError
 from nashium.core.match_result import MatchResult, RuntimeStats, build_derived_match_data
 
-try:
-    import docker
+logger = logging.getLogger(__name__)
 
-    DOCKER_AVAILABLE = True
-except ImportError:
-    DOCKER_AVAILABLE = False
+PROTOCOL_VERSION = 2
+
+LABEL_ROLE = "com.nashium.role"
+LABEL_ROLE_VALUE = "bot-runner"
+LABEL_INSTANCE = "com.nashium.worker-instance"
+
+# Unique per worker process, so concurrent workers on one host never reap each
+# other's live containers (R2).
+INSTANCE_ID = uuid.uuid4().hex
+
+SOCK_DIR_PREFIX = "nashium_"
+MAX_LOAD_RESPONSE = 1024 * 1024
+
+_client = None
+_client_lock = threading.Lock()
 
 
-@dataclass
+def get_client():
+    """Process-wide shared Docker client. Creating one per match leaks FDs."""
+    global _client
+    with _client_lock:
+        if _client is None:
+            try:
+                c = docker.from_env()
+                c.ping()
+            except Exception as e:  # noqa: BLE001
+                raise MatchExecutionError(
+                    f"Cannot connect to the Docker daemon (is it running?): {e}"
+                ) from e
+            _client = c
+        return _client
+
+
+def reset_client() -> None:
+    """Drop the cached client. Call after a harness failure: if the daemon has
+    restarted, the pooled connections are dead and every retry would fail."""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _client = None
+
+
+@dataclass(frozen=True)
 class DockerConfig:
     image: str = "nashium-runner:latest"
-    memory_limit: str | int = "200m"
-    cpu_quota: int = 50000
-    cpu_period: int = 100000
+    memory_limit: int | str = 200 * 1024 * 1024
+    cpu_quota: int = 100_000    # 1 full core: CPU-seconds ~= wall-seconds
+    cpu_period: int = 100_000
     pids_limit: int = 64
+    tmpfs_size: str = "64m"
+    connect_timeout: float = 30.0
+    load_timeout: float = 60.0
+    stats_enabled: bool = True
+    log_max_size: str = "1m"
 
 
-@dataclass(frozen=True, slots=True)
-class StatsSample:
-    """A single stats sample for recording."""
-    timestamp: float
-    memory_bytes: int
-    memory_peak_bytes: int
-    cpu_percent: float
+def parse_memory_limit_bytes(limit: int | str | None) -> int | None:
+    if limit is None:
+        return None
+    if isinstance(limit, int):
+        return limit
+    s = str(limit).strip().lower()
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    units = {"kb": 1024, "mb": 1024**2, "gb": 1024**3,
+             "k": 1024, "m": 1024**2, "g": 1024**3}
+    for suffix in sorted(units, key=len, reverse=True):
+        if s.endswith(suffix):
+            try:
+                return int(float(s[: -len(suffix)].strip()) * units[suffix])
+            except ValueError:
+                return None
+    return None
 
 
-class BackgroundStatsMonitor:
+# ----------------------------------------------------------------- lifecycle
+
+def cleanup_stale_containers(max_age_seconds: float = 900.0) -> int:
+    """Reap bot containers abandoned by a crashed worker.
+
+    Only touches containers older than max_age_seconds (a match cannot exceed
+    ~11 minutes) OR belonging to this worker instance. This keeps concurrent
+    workers on the same host from killing each other's live matches.
     """
-    Non-blocking stats monitor using Docker's streaming API.
-    Runs in a background thread, collecting samples continuously.
-    """
+    try:
+        client = get_client()
+        containers = client.containers.list(
+            all=True, filters={"label": f"{LABEL_ROLE}={LABEL_ROLE_VALUE}"}
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not list bot containers: %s", e)
+        return 0
 
-    def __init__(self, container, sample_interval: float = 0.5):
+    now = time.time()
+    removed = 0
+    for c in containers:
+        try:
+            labels = (c.attrs.get("Config") or {}).get("Labels") or {}
+            mine = labels.get(LABEL_INSTANCE) == INSTANCE_ID
+            created = c.attrs.get("Created", "")
+            age = float("inf")
+            if created:
+                try:
+                    from datetime import datetime, timezone
+                    ts = created.split(".")[0].rstrip("Z")
+                    dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+                    age = now - dt.timestamp()
+                except (ValueError, TypeError):
+                    pass
+            if mine or age > max_age_seconds:
+                c.remove(force=True)
+                removed += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    if removed:
+        logger.info("Removed %d stale bot container(s)", removed)
+    return removed
+
+
+def cleanup_stale_socket_dirs(max_age_seconds: float = 3600.0) -> int:
+    root = tempfile.gettempdir()
+    now = time.time()
+    removed = 0
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0
+    for name in entries:
+        if not name.startswith(SOCK_DIR_PREFIX):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and (now - os.path.getmtime(path)) > max_age_seconds:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def verify_environment(config: DockerConfig | None = None) -> None:
+    """Startup preflight. Raises MatchExecutionError with an actionable message.
+
+    Includes a live protocol handshake, so a stale image is caught here rather
+    than silently timing out every bot in every subsequent match (R1).
+    """
+    config = config or DockerConfig()
+
+    if not hasattr(socket, "AF_UNIX"):
+        raise MatchExecutionError(
+            "Unix sockets are unavailable. Run the worker from Linux or WSL2."
+        )
+
+    client = get_client()
+    try:
+        client.images.get(config.image)
+    except ImageNotFound as e:
+        raise MatchExecutionError(
+            f"Docker image '{config.image}' not found.\n"
+            f"Build it with: docker build -t {config.image} src/nashium/server/"
+        ) from e
+
+    probe = "class Bot:\n    def move(self, state):\n        return 0\n"
+    ex = DockerExecutor(probe, name="preflight", seed=0, config=config)
+    try:
+        if ex.faulted:
+            raise MatchExecutionError(
+                f"Preflight bot failed to run: {ex.error_message}"
+            )
+        if ex.get_move(None) != 0 or ex.faulted:
+            raise MatchExecutionError(
+                f"Preflight bot returned an unexpected result: {ex.error_message}"
+            )
+    finally:
+        ex.close()
+    logger.info("Docker preflight OK (image=%s, protocol=v%d)",
+                config.image, PROTOCOL_VERSION)
+
+
+# ------------------------------------------------------------ stats monitor
+
+class _StatsMonitor:
+    """Background resource sampler over Docker's streaming stats API."""
+
+    def __init__(self, container):
         self._container = container
-        self._sample_interval = sample_interval
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
-
-        self._memory_current: int = 0
-        self._memory_peak: int = 0
-        self._cpu_percent: float = 0.0
-        self._samples: List[StatsSample] = []
-        self._start_time: float = time.time()
-        self._last_sample_time: float = 0.0
+        self._stream = None
+        self._mem_current = 0
+        self._mem_peak = 0
+        self._cpu_percent = 0.0
 
     def start(self) -> None:
-        """Start the background monitoring thread."""
         self._running = True
-        self._start_time = time.time()
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the background monitoring thread."""
         self._running = False
-        if self._thread:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
 
-    def _monitor_loop(self) -> None:
-        """Main monitoring loop - uses streaming API for efficiency."""
+    def _loop(self) -> None:
         try:
-            # Use streaming API - single connection, continuous updates
-            # This is MUCH faster than calling stats(stream=False) repeatedly
-            for stats in self._container.stats(stream=True, decode=True):
+            self._stream = self._container.stats(stream=True, decode=True)
+            for stats in self._stream:
                 if not self._running:
                     break
-
-                now = time.time()
-
-                # Rate-limit sample storage to avoid memory bloat
-                # (Docker streams stats roughly every 1 second anyway)
-                should_store = (now - self._last_sample_time) >= self._sample_interval
-
-                # Parse memory stats
-                mem = stats.get("memory_stats", {})
-                mem_current = mem.get("usage", 0)
-                mem_peak = mem.get("max_usage") or mem_current
-
-                # Parse CPU stats and calculate percentage
-                cpu_pct = self._calculate_cpu_percent(stats)
-
+                mem = stats.get("memory_stats") or {}
+                current = mem.get("usage", 0) or 0
+                peak = mem.get("max_usage") or current  # cgroup v2 has no max_usage
+                pct = self._cpu_percent_of(stats)
                 with self._lock:
-                    self._memory_current = mem_current
-                    self._memory_peak = max(self._memory_peak, mem_peak)
-                    self._cpu_percent = cpu_pct
-
-                    if should_store:
-                        self._samples.append(StatsSample(
-                            timestamp=now - self._start_time,
-                            memory_bytes=mem_current,
-                            memory_peak_bytes=self._memory_peak,
-                            cpu_percent=cpu_pct,
-                        ))
-                        self._last_sample_time = now
-
-        except Exception:
-            # Container stopped or connection lost - this is expected
+                    self._mem_current = current
+                    self._mem_peak = max(self._mem_peak, peak, current)
+                    self._cpu_percent = pct
+        except Exception:  # noqa: BLE001 - container gone / stream closed is expected
             pass
 
-    def _calculate_cpu_percent(self, stats: dict) -> float:
-        """Calculate CPU percentage from Docker stats."""
+    @staticmethod
+    def _cpu_percent_of(stats: dict) -> float:
         try:
-            cpu = stats.get("cpu_stats", {})
-            precpu = stats.get("precpu_stats", {})
-
-            cpu_usage = cpu.get("cpu_usage", {})
-            precpu_usage = precpu.get("cpu_usage", {})
-
-            cpu_total = cpu_usage.get("total_usage", 0)
-            precpu_total = precpu_usage.get("total_usage", 0)
-            cpu_delta = cpu_total - precpu_total
-
-            sys_delta = (
-                    cpu.get("system_cpu_usage", 0) -
-                    precpu.get("system_cpu_usage", 0)
-            )
-
-            if sys_delta > 0 and cpu_delta > 0:
-                # Get number of CPUs
-                percpu = cpu_usage.get("percpu_usage")
-                n_cpus = len(percpu) if percpu else 1
-                return (cpu_delta / sys_delta) * n_cpus * 100.0
-
+            cpu = stats.get("cpu_stats") or {}
+            precpu = stats.get("precpu_stats") or {}
+            delta = ((cpu.get("cpu_usage") or {}).get("total_usage", 0)
+                     - (precpu.get("cpu_usage") or {}).get("total_usage", 0))
+            sys_delta = cpu.get("system_cpu_usage", 0) - precpu.get("system_cpu_usage", 0)
+            if sys_delta > 0 and delta > 0:
+                # online_cpus first: percpu_usage is absent on cgroup v2 (R15).
+                n = cpu.get("online_cpus")
+                if not n:
+                    percpu = (cpu.get("cpu_usage") or {}).get("percpu_usage")
+                    n = len(percpu) if percpu else 1
+                return (delta / sys_delta) * n * 100.0
         except (KeyError, TypeError, ZeroDivisionError):
             pass
-
         return 0.0
 
     @property
     def memory_current(self) -> int:
-        """Current memory usage in bytes."""
         with self._lock:
-            return self._memory_current
+            return self._mem_current
 
     @property
     def memory_peak(self) -> int:
-        """Peak memory usage in bytes."""
         with self._lock:
-            return self._memory_peak
+            return self._mem_peak
 
     @property
     def cpu_percent(self) -> float:
-        """Current CPU usage percentage."""
         with self._lock:
             return self._cpu_percent
 
-    def get_samples(self) -> List[StatsSample]:
-        """Get a copy of all recorded samples."""
-        with self._lock:
-            return list(self._samples)
 
-    def get_summary(self) -> dict:
-        """Get a summary of resource usage."""
-        with self._lock:
-            if not self._samples:
-                return {
-                    "memory_peak_bytes": self._memory_peak,
-                    "memory_peak_mb": self._memory_peak / (1024 * 1024),
-                    "cpu_avg_percent": 0.0,
-                    "cpu_max_percent": 0.0,
-                    "sample_count": 0,
-                }
-
-            cpu_values = [s.cpu_percent for s in self._samples]
-            return {
-                "memory_peak_bytes": self._memory_peak,
-                "memory_peak_mb": self._memory_peak / (1024 * 1024),
-                "cpu_avg_percent": sum(cpu_values) / len(cpu_values),
-                "cpu_max_percent": max(cpu_values),
-                "sample_count": len(self._samples),
-            }
-
+# ---------------------------------------------------------------- executor
 
 class DockerExecutor:
-    """
-    Fast executor using Unix socket with binary protocol.
-    Includes non-blocking background resource monitoring.
-    """
-
-    # Binary protocol constants
     CMD_MOVE = 0
     CMD_QUIT = 1
     MOVE_NONE = 255
+    _RESP = struct.Struct(">BBddd")
 
     def __init__(
-            self,
-            bot_code: str,
-            time_limit: float = 100.0,
-            seed: int | None = None,
-            config: DockerConfig | None = None,
-            name: str = "Bot",
-            enable_stats: bool = True,
-            stats_sample_interval: float = 0.5,
+        self,
+        bot_code: str,
+        *,
+        name: str = "bot",
+        seed: int | None = None,
+        cpu_limit: float = 100.0,
+        wall_limit: float = 300.0,
+        config: DockerConfig | None = None,
     ):
-        if not DOCKER_AVAILABLE:
-            raise RuntimeError("docker package required")
-
-        if not hasattr(socket, 'AF_UNIX'):
-            raise RuntimeError(
-                "Docker mode requires Unix sockets, which are not available on Windows.\n"
-                "Please run from WSL (Windows Subsystem for Linux):\n"
-                "  1. Install WSL: wsl --install\n"
-                "  2. Run your project from within WSL\n"
-                "  3. Docker Desktop should be configured to work with WSL"
-            )
-
         self._config = config or DockerConfig()
-        self._time_limit = time_limit
         self._name = name
-        self._enable_stats = enable_stats
-        self._stats_sample_interval = stats_sample_interval
+        self._cpu_limit = cpu_limit
+        self._wall_limit = wall_limit
 
-        self._elapsed_time = 0.0
+        self._cpu_time = 0.0
+        self._cgroup_cpu = 0.0
+        self._bot_wall_time = 0.0
+        self._host_wall_time = 0.0
+        self._rounds = 0
+        self._default_from_round: int | None = None
+
         self._timed_out = False
         self._errored = False
-        self._error_message: str | None = None
-        self._memory_bytes_peak: int | None = None
-        self._memory_bytes_current: int | None = None
         self._memory_exceeded = False
+        self._error_message: str | None = None
         self._closed = False
 
-        self._client = docker.from_env()
+        self._client = get_client()
         self._container = None
         self._sock_dir: str | None = None
         self._server: socket.socket | None = None
         self._conn: socket.socket | None = None
-        self._stats_monitor: BackgroundStatsMonitor | None = None
+        self._monitor: _StatsMonitor | None = None
+        self._mem_peak_final = 0
+        self._mem_current_final = 0
 
         self._start(bot_code, seed)
 
-    def _parse_memory_limit_bytes(self) -> int | None:
-        limit = self._config.memory_limit
-        if isinstance(limit, int):
-            return limit
-        if not isinstance(limit, str):
-            return None
-
-        s = limit.strip().lower()
-        try:
-            return int(s)
-        except ValueError:
-            pass
-
-        units = {
-            "k": 1024,
-            "kb": 1024,
-            "m": 1024 * 1024,
-            "mb": 1024 * 1024,
-            "g": 1024 * 1024 * 1024,
-            "gb": 1024 * 1024 * 1024,
-        }
-        for suffix, mult in units.items():
-            if s.endswith(suffix):
-                num = s[: -len(suffix)].strip()
-                try:
-                    return int(float(num) * mult)
-                except ValueError:
-                    return None
-        return None
-
-    def poll_usage(self) -> None:
-        """
-        Legacy method - now a no-op since monitoring happens in background.
-        Kept for API compatibility.
-        """
-        pass
+    # -------------------------------------------------------------- startup
 
     def _start(self, bot_code: str, seed: int | None) -> None:
-        print(f"  [{self._name}] Starting container...", end="", flush=True)
-
-        # Create Unix socket in temp directory
-        self._sock_dir = tempfile.mkdtemp(prefix="nashium_")
+        self._sock_dir = tempfile.mkdtemp(prefix=SOCK_DIR_PREFIX)
+        # mkdtemp is 0700/host-UID; the container is UID 1000 and needs +x to
+        # traverse the mount. 0711 grants traversal without listing or writing -
+        # 0777 would let any local user swap the socket and drive the match (R5).
+        os.chmod(self._sock_dir, 0o711)
         sock_path = os.path.join(self._sock_dir, "ipc.sock")
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind(sock_path)
         self._server.listen(1)
-        os.chmod(sock_path, 0o777)
+        os.chmod(sock_path, 0o666)
 
         try:
             self._container = self._client.containers.run(
                 image=self._config.image,
-                command=["python", "/app/_docker_runner.py", "/ipc/ipc.sock"],
+                command=["python", "-B", "/app/_docker_runner.py", "/ipc/ipc.sock"],
                 detach=True,
                 mem_limit=self._config.memory_limit,
+                memswap_limit=self._config.memory_limit,
                 cpu_quota=self._config.cpu_quota,
                 cpu_period=self._config.cpu_period,
                 pids_limit=self._config.pids_limit,
@@ -314,570 +379,487 @@ class DockerExecutor:
                 security_opt=["no-new-privileges:true"],
                 cap_drop=["ALL"],
                 volumes={self._sock_dir: {"bind": "/ipc", "mode": "rw"}},
-                tmpfs={"/tmp": "size=10M,noexec,nosuid,nodev"},
+                # noexec restored (R6): nothing in the package set execs from /tmp.
+                tmpfs={"/tmp": f"size={self._config.tmpfs_size},"
+                               f"mode=1777,noexec,nosuid,nodev"},
+                environment={
+                    "PYTHONUNBUFFERED": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "HOME": "/tmp",
+                    "XDG_CACHE_HOME": "/tmp/.cache",
+                    "MPLCONFIGDIR": "/tmp/.cache/matplotlib",
+                    # Single-threaded BLAS: N threads in a 1-core cgroup is pure
+                    # contention, and it makes CPU accounting meaningless.
+                    "OMP_NUM_THREADS": "1",
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "NUMEXPR_NUM_THREADS": "1",
+                },
+                log_config={"type": "json-file",
+                            "config": {"max-size": self._config.log_max_size,
+                                       "max-file": "1"}},
+                labels={LABEL_ROLE: LABEL_ROLE_VALUE, LABEL_INSTANCE: INSTANCE_ID},
                 remove=False,
                 user="1000:1000",
             )
-        except docker.errors.ImageNotFound:
-            print(" FAILED", flush=True)
-            self._cleanup_socket()
-            raise RuntimeError(
-                f"Docker image '{self._config.image}' not found.\n"
-                f"Build with: docker build -t {self._config.image} src/nashium/server/"
-            )
-        except Exception as e:
-            print(" FAILED", flush=True)
-            self._cleanup_socket()
-            raise RuntimeError(f"Failed to start container: {e}")
+        except ImageNotFound as e:
+            self._teardown()
+            raise MatchExecutionError(
+                f"Docker image '{self._config.image}' not found. Build with: "
+                f"docker build -t {self._config.image} src/nashium/server/"
+            ) from e
+        except Exception as e:  # noqa: BLE001
+            self._teardown()
+            raise MatchExecutionError(f"Failed to start container: {e}") from e
 
-        print(" started", flush=True)
+        if self._config.stats_enabled:
+            self._monitor = _StatsMonitor(self._container)
+            self._monitor.start()
 
-        # Start background stats monitoring (non-blocking)
-        if self._enable_stats:
-            self._stats_monitor = BackgroundStatsMonitor(
-                self._container,
-                sample_interval=self._stats_sample_interval
-            )
-            self._stats_monitor.start()
+        self._accept_connection()
+        self._load_bot(bot_code, seed)
 
-        # Wait for container to connect
-        print(f"  [{self._name}] Loading bot...", end="", flush=True)
+    def _accept_connection(self) -> None:
+        deadline = time.monotonic() + self._config.connect_timeout
+        self._server.settimeout(1.0)
+        while True:
+            try:
+                self._conn, _ = self._server.accept()
+                return
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    logs = self._container_logs()
+                    self._teardown()
+                    raise MatchExecutionError(
+                        f"[{self._name}] container never connected within "
+                        f"{self._config.connect_timeout:.0f}s. Logs:\n{logs}"
+                    )
+                try:
+                    self._container.reload()
+                    if self._container.status in ("exited", "dead"):
+                        logs = self._container_logs()
+                        self._teardown()
+                        raise MatchExecutionError(
+                            f"[{self._name}] container exited during startup. "
+                            f"Logs:\n{logs}"
+                        )
+                except MatchExecutionError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
 
-        self._server.settimeout(10.0)
-        try:
-            self._conn, _ = self._server.accept()
-            # allows docker at least 10 seconds to load properly
-            self._conn.settimeout(10)
-        except socket.timeout:
-            print(" FAILED", flush=True)
-            self._kill()
-            raise RuntimeError("Container failed to connect")
-
-        # Load bot
-        try:
-            self._send_load(bot_code, seed)
-            print(" ready ✓", flush=True)
-        except Exception as e:
-            print(" FAILED", flush=True)
-            self._kill()
-            raise
-
-    def _send_load(self, code: str, seed: int | None) -> None:
-        """Send load command with JSON, receive JSON response."""
-        msg = {"cmd": "load", "code": code}
+    def _load_bot(self, code: str, seed: int | None) -> None:
+        msg = {"cmd": "load", "protocol": PROTOCOL_VERSION, "code": code}
         if seed is not None:
             msg["seed"] = seed
-
         data = json.dumps(msg).encode()
-        self._conn.sendall(struct.pack(">I", len(data)) + data)
 
-        # Receive response
-        raw_len = self._recvall(4)
-        if not raw_len:
-            raise BotLoadError("Connection closed during load")
+        self._conn.settimeout(self._config.load_timeout)
+        try:
+            self._conn.sendall(struct.pack(">I", len(data)) + data)
+            raw_len = self._recv_exact(4)
+            if raw_len is None:
+                self._fault_bot("Bot process exited while loading")
+                return
+            length = struct.unpack(">I", raw_len)[0]
+            if length > MAX_LOAD_RESPONSE:
+                # The bot's code runs in the same process as the runner, so a
+                # hostile bot can seize the socket. Bound every host-side read.
+                self._teardown()
+                raise MatchExecutionError(
+                    f"[{self._name}] container sent an oversized load response "
+                    f"({length} bytes) - protocol violation"
+                )
+            body = self._recv_exact(length)
+            if body is None:
+                self._fault_bot("Bot process exited while loading")
+                return
+            resp = json.loads(body)
+        except socket.timeout:
+            self._fault_timeout(
+                f"Bot failed to initialise within {self._config.load_timeout:.0f}s "
+                f"(infinite loop or extremely slow import at module level)"
+            )
+            return
+        except MatchExecutionError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._fault_bot(f"Bot load failed: {e}")
+            return
 
-        length = struct.unpack(">I", raw_len)[0]
-        resp_data = self._recvall(length)
-        resp = json.loads(resp_data)
+        got = resp.get("protocol")
+        if got != PROTOCOL_VERSION:
+            self._teardown()
+            raise MatchExecutionError(
+                f"Runner image speaks protocol v{got}, host expects "
+                f"v{PROTOCOL_VERSION}. The image is stale - rebuild it:\n"
+                f"  docker build -t {self._config.image} src/nashium/server/"
+            )
 
         if resp.get("status") != "ok":
-            raise BotLoadError(resp.get("error", "Load failed"))
+            self._fault_bot(resp.get("error") or "Bot load failed")
+            return
+        logger.debug("[%s] bot loaded", self._name)
 
-    def _recvall(self, n: int) -> bytes:
-        """Receive exactly n bytes."""
+    # ----------------------------------------------------------------- play
+
+    @property
+    def faulted(self) -> bool:
+        return self._timed_out or self._errored or self._memory_exceeded or self._closed
+
+    def get_move(self, opponent_last_move: int | None) -> int:
+        """Return the bot's move, or 0 if it has faulted. Never raises for bot faults."""
+        if self.faulted:
+            return 0
+        if self._billed_cpu >= self._cpu_limit:
+            self._fault_timeout(f"CPU budget of {self._cpu_limit:.0f}s exhausted")
+            return 0
+        if self._host_wall_time >= self._wall_limit:
+            self._fault_timeout(f"Wall-clock budget of {self._wall_limit:.0f}s exhausted")
+            return 0
+
+        budget = min(self._cpu_limit - self._billed_cpu,
+                     self._wall_limit - self._host_wall_time)
+        self._conn.settimeout(max(1.0, budget) + 1.0)
+
+        opp = self.MOVE_NONE if opponent_last_move is None else int(opponent_last_move)
+        t0 = time.perf_counter()
+        try:
+            self._conn.sendall(bytes((self.CMD_MOVE, opp)))
+            resp = self._recv_exact(self._RESP.size)
+        except socket.timeout:
+            self._host_wall_time += time.perf_counter() - t0
+            self._fault_timeout("Bot did not respond within its remaining time budget")
+            return 0
+        except (OSError, ConnectionError) as e:
+            self._host_wall_time += time.perf_counter() - t0
+            self._fault_connection_lost(f"IPC failure: {e}")
+            return 0
+        self._host_wall_time += time.perf_counter() - t0
+
+        if resp is None:
+            self._fault_connection_lost("Bot process exited unexpectedly")
+            return 0
+
+        status, move, cpu, wall, cgroup = self._RESP.unpack(resp)
+        self._cpu_time += cpu
+        self._bot_wall_time += wall
+        if cgroup >= 0.0:
+            self._cgroup_cpu = max(self._cgroup_cpu, cgroup)
+        self._rounds += 1
+
+        if status != 0:
+            self._fault_bot(self._container_logs()
+                            or "Bot raised an exception in move()")
+            return 0
+        if move not in (0, 1):
+            self._fault_bot(f"Bot returned an invalid move: {move}")
+            return 0
+        if self._billed_cpu >= self._cpu_limit:
+            self._fault_timeout(f"CPU budget of {self._cpu_limit:.0f}s exhausted")
+        return move
+
+    @property
+    def _billed_cpu(self) -> float:
+        """process_time misses child processes; the cgroup counter does not.
+        Billing the max closes the subprocess-evasion hole (R12)."""
+        return max(self._cpu_time, self._cgroup_cpu)
+
+    # ---------------------------------------------------------------- fault
+
+    def _mark_default_start(self) -> None:
+        if self._default_from_round is None:
+            self._default_from_round = self._rounds
+
+    def _fault_bot(self, message: str) -> None:
+        if self.faulted:
+            return
+        self._check_oom()
+        if self._memory_exceeded:
+            self._mark_default_start()
+            return
+        self._errored = True
+        self._error_message = message
+        self._mark_default_start()
+        logger.debug("[%s] faulted: %s", self._name, message)
+
+    def _fault_timeout(self, message: str) -> None:
+        if self.faulted:
+            return
+        self._timed_out = True
+        self._error_message = message
+        self._mark_default_start()
+
+    def _fault_connection_lost(self, message: str) -> None:
+        if self.faulted:
+            return
+        self._check_oom()
+        if self._memory_exceeded:
+            self._mark_default_start()
+            return
+        self._errored = True
+        self._error_message = self._container_logs() or message
+        self._mark_default_start()
+
+    def _check_oom(self) -> None:
+        if self._container is None:
+            return
+        try:
+            self._container.reload()
+            state = (self._container.attrs or {}).get("State") or {}
+            if state.get("OOMKilled") or state.get("ExitCode") == 137:
+                self._memory_exceeded = True
+                self._errored = False
+                self._timed_out = False
+                self._error_message = "Container exceeded its memory limit (OOM-killed)"
+        except Exception:  # noqa: BLE001
+            return
+
+    def _container_logs(self, tail: int = 40) -> str:
+        try:
+            if self._container is None:
+                return ""
+            raw = self._container.logs(stdout=False, stderr=True, tail=tail)
+            return raw.decode("utf-8", errors="replace").strip()[:4000]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # ----------------------------------------------------------------- misc
+
+    def _recv_exact(self, n: int) -> bytes | None:
         data = bytearray()
         while len(data) < n:
             chunk = self._conn.recv(n - len(data))
             if not chunk:
-                return bytes(data)
+                return None
             data.extend(chunk)
         return bytes(data)
 
-    def get_move(self, opponent_last_move: int | None) -> int:
-        if self._timed_out or self._errored or self._closed or self._memory_exceeded:
-            return 0
-
-        if self._elapsed_time > self._time_limit:
-            self._timed_out = True
-            return 0
-
-        opp = self.MOVE_NONE if opponent_last_move is None else opponent_last_move
-
-        # Set socket timeout to remaining time (plus small buffer for IPC overhead)
-        remaining = self._time_limit - self._elapsed_time
-        self._conn.settimeout(remaining + 0.5)
-
-        start = time.perf_counter()
-
-        try:
-            self._conn.sendall(bytes([self.CMD_MOVE, opp]))
-        except Exception as e:
-            self._elapsed_time += time.perf_counter() - start
-            self._errored = True
-            self._error_message = f"Send failed: {e}"
-            self._check_oom_killed()
-            return 0
-
-        try:
-            resp = self._recvall(10)
-        except socket.timeout:
-            self._elapsed_time += time.perf_counter() - start
-            self._timed_out = True
-            self._error_message = "Move timed out"
-            return 0
-        except Exception as e:
-            self._elapsed_time += time.perf_counter() - start
-            self._errored = True
-            self._error_message = f"Recv failed: {e}"
-            self._check_oom_killed()
-            return 0
-
-        elapsed = time.perf_counter() - start
-
-        if len(resp) < 10:
-            self._elapsed_time += elapsed
-            self._errored = True
-            self._error_message = "Incomplete response"
-            self._check_oom_killed()
-            return 0
-
-        status, move = resp[0], resp[1]
-
-        if status != 0:
-            self._elapsed_time += elapsed
-            self._errored = True
-            self._error_message = f"Bot error (status={status})"
-
-            # "Pick up" the error trace from Docker logs safely
-            try:
-                if self._container:
-                    # tail=50 ensures we only read a safe amount of text, maintaining security
-                    err_logs = self._container.logs(stdout=False, stderr=True, tail=50)
-                    if err_logs:
-                        safe_logs = err_logs.decode('utf-8', errors='replace').strip()
-                        if safe_logs:
-                            self._error_message = f"Bot runtime error:\n{safe_logs}"
-            except Exception:
-                pass # Fallback to the generic error message if logs fail
-
-            return 0
-
-        self._elapsed_time += elapsed
-
-        if self._elapsed_time > self._time_limit:
-            self._timed_out = True
-
-        if move not in (0, 1):
-            raise InvalidMoveError(f"Invalid move: {move}")
-
-        return move
-
-    def _check_oom_killed(self) -> None:
-        if self._container is None:
-            return
-
-        try:
-            self._container.reload()
-            state = (self._container.attrs or {}).get("State") or {}
-            if state.get("OOMKilled"):
-                self._memory_exceeded = True
-                self._errored = False
-                self._error_message = "Container was OOM-killed"
-        except Exception:
-            return
-
-    def _cleanup_socket(self) -> None:
-        if self._conn:
-            try:
-                self._conn.close()
-            except:
-                pass
-        if self._server:
-            try:
-                self._server.close()
-            except:
-                pass
-        if self._sock_dir and os.path.exists(self._sock_dir):
-            try:
-                shutil.rmtree(self._sock_dir)
-            except:
-                pass
-
-    def _kill(self) -> None:
-        # Stop stats monitor first
-        if self._stats_monitor:
-            self._stats_monitor.stop()
-            self._stats_monitor = None
-
-        self._cleanup_socket()
-
-        if self._container:
-            try:
-                self._container.kill()
-            except:
-                pass
-            try:
-                self._container.remove(force=True)
-            except:
-                pass
+    @property
+    def name(self) -> str:
+        return self._name
 
     @property
     def elapsed_time(self) -> float:
-        return self._elapsed_time
+        return self._billed_cpu
+
+    @property
+    def wall_time(self) -> float:
+        return self._host_wall_time
+
+    @property
+    def rounds_played(self) -> int:
+        return self._rounds
+
+    @property
+    def default_from_round(self) -> int | None:
+        return self._default_from_round
 
     @property
     def timed_out(self) -> bool:
         return self._timed_out
 
     @property
-    def memory_bytes_peak(self) -> int | None:
-        if self._stats_monitor:
-            peak = self._stats_monitor.memory_peak
-            if peak > 0:
-                return peak
-        return self._memory_bytes_peak
-
-    @property
-    def memory_bytes_current(self) -> int | None:
-        if self._stats_monitor:
-            current = self._stats_monitor.memory_current
-            if current > 0:
-                return current
-        return self._memory_bytes_current
-
-    @property
-    def cpu_percent(self) -> float:
-        """Current CPU usage percentage."""
-        if self._stats_monitor:
-            return self._stats_monitor.cpu_percent
-        return 0.0
+    def errored(self) -> bool:
+        return self._errored
 
     @property
     def memory_exceeded(self) -> bool:
         return self._memory_exceeded
 
     @property
-    def errored(self) -> bool:
-        return self._errored
-
-    @property
     def error_message(self) -> str | None:
         return self._error_message
 
-    def get_stats_samples(self) -> List[StatsSample]:
-        """
-        Get all recorded stats samples.
-        Useful for saving to file after the match.
-        """
-        if self._stats_monitor:
-            return self._stats_monitor.get_samples()
-        return []
+    @property
+    def memory_bytes_peak(self) -> int | None:
+        # Cached so the value survives teardown (R9).
+        if self._monitor is not None:
+            self._mem_peak_final = max(self._mem_peak_final, self._monitor.memory_peak)
+        return self._mem_peak_final or None
 
-    def get_stats_summary(self) -> dict:
-        """
-        Get a summary of resource usage.
-        Returns dict with memory_peak_bytes, memory_peak_mb, cpu_avg_percent, cpu_max_percent.
-        """
-        if self._stats_monitor:
-            return self._stats_monitor.get_summary()
-        return {
-            "memory_peak_bytes": self._memory_bytes_peak or 0,
-            "memory_peak_mb": (self._memory_bytes_peak or 0) / (1024 * 1024),
-            "cpu_avg_percent": 0.0,
-            "cpu_max_percent": 0.0,
-            "sample_count": 0,
-        }
+    @property
+    def memory_bytes_current(self) -> int | None:
+        if self._monitor is not None:
+            self._mem_current_final = self._monitor.memory_current
+        return self._mem_current_final or None
 
-    def save_stats_csv(self, filepath: str) -> None:
-        """
-        Save stats samples to a CSV file.
+    def _teardown(self) -> None:
+        if self._monitor is not None:
+            self._mem_peak_final = max(self._mem_peak_final, self._monitor.memory_peak)
 
-        Args:
-            filepath: Path to the output CSV file.
-        """
-        samples = self.get_stats_samples()
-        with open(filepath, 'w') as f:
-            f.write("timestamp,memory_bytes,memory_peak_bytes,cpu_percent\n")
-            for s in samples:
-                f.write(f"{s.timestamp:.3f},{s.memory_bytes},{s.memory_peak_bytes},{s.cpu_percent:.2f}\n")
+        # Container first: the stats stream blocks on read and only unblocks
+        # when the container disappears (R14).
+        if self._container is not None:
+            try:
+                self._container.remove(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            self._container = None
 
-    def save_stats_json(self, filepath: str) -> None:
-        """
-        Save stats samples and summary to a JSON file.
+        if self._monitor is not None:
+            self._monitor.stop()
+            self._monitor = None
 
-        Args:
-            filepath: Path to the output JSON file.
-        """
-        samples = self.get_stats_samples()
-        data = {
-            "summary": self.get_stats_summary(),
-            "samples": [
-                {
-                    "timestamp": s.timestamp,
-                    "memory_bytes": s.memory_bytes,
-                    "memory_peak_bytes": s.memory_peak_bytes,
-                    "cpu_percent": s.cpu_percent,
-                }
-                for s in samples
-            ]
-        }
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
+        for sock in (self._conn, self._server):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self._conn = self._server = None
+
+        if self._sock_dir and os.path.isdir(self._sock_dir):
+            shutil.rmtree(self._sock_dir, ignore_errors=True)
+        self._sock_dir = None
 
     def close(self) -> None:
         if self._closed:
             return
+        if not self._memory_exceeded:
+            self._check_oom()
+        if self._conn is not None:
+            try:
+                self._conn.sendall(bytes((self.CMD_QUIT, 0)))
+            except OSError:
+                pass
+        self._teardown()
         self._closed = True
 
-        if self._conn:
-            try:
-                self._conn.sendall(bytes([self.CMD_QUIT, 0]))
-            except:
-                pass
-
-        self._kill()
-
-    def __enter__(self):
+    def __enter__(self) -> "DockerExecutor":
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_exc) -> None:
         self.close()
 
 
-class Backend(ABC):
-    """Abstract backend for bot execution."""
+# ------------------------------------------------------------------- match
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Human-readable backend name."""
-        ...
-
-    @abstractmethod
-    def run_match_result_between_files(
-        self,
-        path_a: Path,
-        path_b: Path,
-        seed: int,
-        config: MatchConfig,
-        capture_history: bool = False,
-    ) -> MatchResult:
-        ...
+def _snapshot(ex: DockerExecutor, cpu_budget: float, mem_budget: int | None):
+    cpu_frac = (ex.elapsed_time / cpu_budget) if cpu_budget else 0.0
+    cpu_scaled = int(max(0.0, min(1.0, cpu_frac)) * 1000)
+    mem = ex.memory_bytes_current or ex.memory_bytes_peak
+    mem_scaled = (int(max(0.0, min(1.0, mem / mem_budget)) * 1000)
+                  if (mem_budget and mem) else 0)
+    return cpu_scaled, mem_scaled
 
 
-class DockerBackend(Backend):
-    """Docker container isolation (slow, full isolation)."""
+def _runtime_stats(ex: DockerExecutor, mem_budget: int | None) -> RuntimeStats:
+    return RuntimeStats(
+        elapsed_time_seconds=ex.elapsed_time,
+        wall_seconds=ex.wall_time,
+        timed_out=ex.timed_out,
+        memory_exceeded=ex.memory_exceeded,
+        errored=ex.errored,
+        error_message=ex.error_message,
+        memory_bytes_peak=ex.memory_bytes_peak,
+        memory_bytes_limit=mem_budget,
+        rounds_played=ex.rounds_played,
+        default_from_round=ex.default_from_round,
+    )
 
-    def __init__(self):
-        super().__init__()
-        self._validate_docker()
 
-    def _validate_docker(self) -> None:
-        """Validate Docker is available and properly configured."""
-        if not DOCKER_AVAILABLE:
-            raise RuntimeError(
-                "Docker backend requires 'docker' package.\n"
-                "Install with: pip install docker"
-            )
+def run_match(
+    *,
+    submitted_code: str,
+    leaderboard_code: str,
+    seed: int,
+    config: MatchConfig,
+    docker_config: DockerConfig | None = None,
+    capture_history: bool = True,
+) -> MatchResult:
+    """Run one full match in two sandboxed containers.
 
-        try:
-            client = docker.from_env()
-            client.ping()
-        except Exception as e:
-            raise RuntimeError(
-                f"Cannot connect to Docker daemon. Is Docker running?\n"
-                f"Error: {e}"
-            )
+    A faulted bot plays 0 for every remaining round and the match still runs to
+    completion; wins are counted normally. Raises MatchExecutionError only for
+    harness problems, which the caller must treat as blocking.
+    """
+    docker_config = docker_config or DockerConfig(
+        memory_limit=config.max_total_memory_bytes_per_bot)
+    mem_budget = parse_memory_limit_bytes(docker_config.memory_limit)
+    cpu_budget = config.max_total_time_seconds_per_bot
+    wall_budget = config.max_total_wall_seconds_per_bot
 
-        config = DockerConfig()
-        try:
-            client.images.get(config.image)
-        except docker.errors.ImageNotFound:
-            raise RuntimeError(
-                f"Docker image '{config.image}' not found.\n"
-                f"Build with: docker build -t {config.image} src/nashium/server/"
-            )
+    start = time.perf_counter()
 
-    @property
-    def name(self) -> str:
-        return "docker container"
+    sub_hist: list[int] = []
+    lead_raw_hist: list[int] = []
+    lead_eff_hist: list[int] = []
+    sub_cpu: list[int] = []
+    sub_ram: list[int] = []
+    lead_cpu: list[int] = []
+    lead_ram: list[int] = []
+    sample_interval = max(1, int(config.rounds * 0.005))
 
-    def run_match_result_between_files(
-            self,
-            path_a: Path,
-            path_b: Path,
-            seed: int,
-            config: MatchConfig,
-            capture_history: bool = False,
-    ) -> MatchResult:
-        """Satisfy the Backend interface by reading files and executing from strings."""
-        with open(path_a, "r", encoding="utf-8") as f_a:
-            submitted_source = f_a.read()
-        with open(path_b, "r", encoding="utf-8") as f_b:
-            opponent_source = f_b.read()
+    with DockerExecutor(submitted_code, name="submitted", seed=seed,
+                        cpu_limit=cpu_budget, wall_limit=wall_budget,
+                        config=docker_config) as submitted, \
+         DockerExecutor(leaderboard_code, name="leaderboard", seed=seed,
+                        cpu_limit=cpu_budget, wall_limit=wall_budget,
+                        config=docker_config) as leaderboard:
 
-        return self.run_match_result_from_strings(
-            submitted_source,
-            opponent_source,
-            seed,
-            config,
-            capture_history
-        )
+        submitted_wins = 0
+        last_submitted: int | None = None
+        last_lead_effective: int | None = None
 
-    def run_match_result_from_strings(self, submitted_source: str, opponent_source: str, seed: int, config: MatchConfig,
-                                      capture_history: bool = False) -> MatchResult:
-        start = time.perf_counter()
+        for rnd in range(1, config.rounds + 1):
+            s_move = submitted.get_move(last_lead_effective)
+            l_raw = leaderboard.get_move(last_submitted)
+            l_move = 1 - l_raw  # inversion makes the game zero-sum
 
-        with DockerExecutor(
-            submitted_source,
-            time_limit=config.max_total_time_seconds_per_bot,
-            seed=seed,
-            config=DockerConfig(memory_limit=(config.max_total_memory_bytes_per_bot or "200m")),
-        ) as submitted:
-            with DockerExecutor(
-                opponent_source,
-                time_limit=config.max_total_time_seconds_per_bot,
-                seed=seed,
-                config=DockerConfig(memory_limit=(config.max_total_memory_bytes_per_bot or "200m")),
-            ) as opponent:
-                submitted_wins = 0
-                last_submitted_move: int | None = None
-                last_opponent_effective: int | None = None
-                rounds_played = 0
+            if s_move == l_move:
+                submitted_wins += 1
 
-                if capture_history:
-                    submitted_history: list[int] = []
-                    opponent_raw_history: list[int] = []
-                    opponent_effective_history: list[int] = []
-                    submitted_cpu_usage_samples: list[int] = []
-                    submitted_ram_usage_samples: list[int] = []
-                    opponent_cpu_usage_samples: list[int] = []
-                    opponent_ram_usage_samples: list[int] = []
+            if capture_history:
+                sub_hist.append(s_move)
+                lead_raw_hist.append(l_raw)
+                lead_eff_hist.append(l_move)
 
-                    sample_interval = max(1, int(config.rounds * 0.005))
+            last_submitted = s_move
+            last_lead_effective = l_move
 
-                for _ in range(config.rounds):
-                    s_move = submitted.get_move(last_opponent_effective)
-                    o_move_raw = opponent.get_move(last_submitted_move)
-                    o_move = 1 - o_move_raw
+            if capture_history and (rnd % sample_interval == 0 or rnd == config.rounds):
+                c, m = _snapshot(submitted, cpu_budget, mem_budget)
+                sub_cpu.append(c)
+                sub_ram.append(m)
+                c, m = _snapshot(leaderboard, cpu_budget, mem_budget)
+                lead_cpu.append(c)
+                lead_ram.append(m)
 
-                    if s_move == o_move:
-                        submitted_wins += 1
+        wall_time = time.perf_counter() - start
+        sub_rt = _runtime_stats(submitted, mem_budget)
+        lead_rt = _runtime_stats(leaderboard, mem_budget)
 
-                    if capture_history:
-                        submitted_history.append(s_move)
-                        opponent_raw_history.append(o_move_raw)
-                        opponent_effective_history.append(o_move)
+    import dataclasses
+    sub_rt = dataclasses.replace(sub_rt, cpu_usage_samples=tuple(sub_cpu),
+                                 ram_usage_samples=tuple(sub_ram))
+    lead_rt = dataclasses.replace(lead_rt, cpu_usage_samples=tuple(lead_cpu),
+                                  ram_usage_samples=tuple(lead_ram))
 
-                    last_submitted_move = s_move
-                    last_opponent_effective = o_move
-                    rounds_played += 1
+    sub_moves = tuple(sub_hist)
+    lead_eff = tuple(lead_eff_hist)
 
-                    if capture_history and (
-                            rounds_played % sample_interval == 0
-                            or rounds_played == config.rounds
-                    ):
-                        for ex in (submitted, opponent):
-                            poll = getattr(ex, "poll_usage", None)
-                            if callable(poll):
-                                poll()
+    score: tuple[int, ...] = ()
+    deduced: tuple[int, ...] = ()
+    s_bot = l_bot = None
+    if capture_history:
+        score, deduced, s_bot, l_bot = build_derived_match_data(
+            submitted_moves=sub_moves, leaderboard_moves_effective=lead_eff)
 
-                        time_budget = config.max_total_time_seconds_per_bot
-                        mem_budget = config.max_total_memory_bytes_per_bot
-
-                        sub_cpu_frac = (submitted.elapsed_time / time_budget) if time_budget else 0.0
-                        sub_cpu_scaled = int(max(0.0, min(1.0, sub_cpu_frac)) * 1000)
-                        submitted_cpu_usage_samples.append(sub_cpu_scaled)
-
-                        opp_cpu_frac = (opponent.elapsed_time / time_budget) if time_budget else 0.0
-                        opp_cpu_scaled = int(max(0.0, min(1.0, opp_cpu_frac)) * 1000)
-                        opponent_cpu_usage_samples.append(opp_cpu_scaled)
-
-                        sub_mem_current = getattr(submitted, "memory_bytes_current", None)
-                        if sub_mem_current is None:
-                            sub_mem_current = getattr(submitted, "memory_bytes_peak", None)
-
-                        if mem_budget and sub_mem_current is not None:
-                            sub_mem_frac = sub_mem_current / mem_budget
-                            sub_mem_scaled = int(max(0.0, min(1.0, sub_mem_frac)) * 1000)
-                        else:
-                            sub_mem_scaled = 0
-                        submitted_ram_usage_samples.append(sub_mem_scaled)
-
-                        opp_mem_current = getattr(opponent, "memory_bytes_current", None)
-                        if opp_mem_current is None:
-                            opp_mem_current = getattr(opponent, "memory_bytes_peak", None)
-
-                        if mem_budget and opp_mem_current is not None:
-                            opp_mem_frac = opp_mem_current / mem_budget
-                            opp_mem_scaled = int(max(0.0, min(1.0, opp_mem_frac)) * 1000)
-                        else:
-                            opp_mem_scaled = 0
-                        opponent_ram_usage_samples.append(opp_mem_scaled)
-
-                wall_time = time.perf_counter() - start
-
-                for ex in (submitted, opponent):
-                    poll = getattr(ex, "poll_usage", None)
-                    if callable(poll):
-                        poll()
-
-                # Check for errors (distinct from timeouts)
-                submitted_errored = getattr(submitted, 'errored', False)
-                opponent_errored = getattr(opponent, 'errored', False)
-
-                submitted_stats = RuntimeStats(
-                    elapsed_time_seconds=submitted.elapsed_time,
-                    timed_out=submitted.timed_out,
-                    memory_exceeded=getattr(submitted, "memory_exceeded", False),
-                    errored=bool(submitted_errored),
-                    error_message=getattr(submitted, "error_message", None),
-                    memory_bytes_peak=getattr(submitted, "memory_bytes_peak", None),
-                    cpu_usage_samples=tuple(submitted_cpu_usage_samples) if capture_history else (),
-                    ram_usage_samples=tuple(submitted_ram_usage_samples) if capture_history else (),
-                )
-
-                opponent_stats = RuntimeStats(
-                    elapsed_time_seconds=opponent.elapsed_time,
-                    timed_out=opponent.timed_out,
-                    memory_exceeded=getattr(opponent, "memory_exceeded", False),
-                    errored=bool(opponent_errored),
-                    error_message=getattr(opponent, "error_message", None),
-                    memory_bytes_peak=getattr(opponent, "memory_bytes_peak", None),
-                    cpu_usage_samples=tuple(opponent_cpu_usage_samples) if capture_history else (),
-                    ram_usage_samples=tuple(opponent_ram_usage_samples) if capture_history else (),
-                )
-
-                submitted_moves_t = tuple(submitted_history) if capture_history else ()
-                opponent_raw_t = tuple(opponent_raw_history) if capture_history else ()
-                opponent_eff_t = tuple(opponent_effective_history) if capture_history else ()
-
-                score_per_round: tuple[int, ...] = ()
-                leaderboard_output_deduced: tuple[int, ...] = ()
-                s_bot_stats = None
-                o_bot_stats = None
-                if capture_history:
-                    score_per_round, leaderboard_output_deduced, s_bot_stats, o_bot_stats = build_derived_match_data(
-                        submitted_moves=submitted_moves_t,
-                        leaderboard_moves_effective=opponent_eff_t,
-                    )
-
-                match_result = MatchResult(
-                    seed=seed,
-                    config=config,
-                    rounds=config.rounds,
-                    submitted_wins=submitted_wins,
-                    submitted_win_rate=submitted_wins / config.rounds if config.rounds else 0.0,
-                    submitted=submitted_stats,
-                    leaderboard=opponent_stats,
-                    wall_time_seconds=wall_time,
-                    submitted_moves=submitted_moves_t,
-                    leaderboard_moves_raw=opponent_raw_t,
-                    leaderboard_moves_effective=opponent_eff_t,
-                    submitted_performance=score_per_round,
-                    leaderboard_output_deduced=leaderboard_output_deduced,
-                    submitted_stats=s_bot_stats,
-                    leaderboard_stats=o_bot_stats,
-                )
-
-                return match_result
+    return MatchResult(
+        seed=seed,
+        config=config,
+        rounds=config.rounds,
+        submitted_wins=submitted_wins,
+        submitted_win_rate=submitted_wins / config.rounds if config.rounds else 0.0,
+        submitted=sub_rt,
+        leaderboard=lead_rt,
+        wall_time_seconds=wall_time,
+        submitted_moves=sub_moves,
+        leaderboard_moves_raw=tuple(lead_raw_hist),
+        leaderboard_moves_effective=lead_eff,
+        submitted_performance=score,
+        leaderboard_output_deduced=deduced,
+        submitted_stats=s_bot,
+        leaderboard_stats=l_bot,
+    )

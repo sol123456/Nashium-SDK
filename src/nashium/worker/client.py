@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import time
 
 from .models import (
     NextQueuedInteractionDTO,
@@ -63,15 +64,23 @@ class NashiumClient:
         self.worker_token = worker_token
         self.timeout = timeout
 
-        # Configure session with retries
-        self.session = requests.Session()
+        self.max_retries = max_retries
 
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1,
+        # Auto-retry only idempotent GETs. Retrying POST /claim-next after a
+        # lost 200 claims a second interaction and strands the first (R18).
+        # POST /result is retried explicitly below - it is keyed by
+        # interactionId, so repeating it is safe.
+        self.session = requests.Session()
+        self.session.mount("http://", HTTPAdapter(max_retries=Retry(
+            total=max_retries, backoff_factor=1,
             status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-        )
+            allowed_methods=frozenset(["GET"]),
+        )))
+        self.session.mount("https://", HTTPAdapter(max_retries=Retry(
+            total=max_retries, backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+        )))
 
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
@@ -132,7 +141,9 @@ class NashiumClient:
         except requests.exceptions.Timeout as e:
             raise NashiumClientError(f"Request timed out: {e}") from e
         except requests.exceptions.HTTPError as e:
-            raise NashiumClientError(f"HTTP error: {e}") from e
+            if e.response is not None and 500 <= e.response.status_code < 600:
+                raise NashiumClientError(f"HTTP error: {e}") from e
+            raise
 
     def submit_result(self, submission: MatchResultSubmissionDTO) -> InteractionDTO:
         """
@@ -149,35 +160,51 @@ class NashiumClient:
             NashiumClientError: For other HTTP errors.
         """
         url = self._url("/api/worker/result")
+        payload = submission.model_dump(exclude_none=True)
+        last_error: Exception | None = None
 
-        try:
-            # Convert to JSON, excluding None values
-            payload = submission.model_dump(exclude_none=True)
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(url, json=payload, timeout=self.timeout)
 
-            logger.debug(f"Submitting result for interaction {submission.interactionId}")
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid worker token")
 
-            response = self.session.post(url, json=payload, timeout=self.timeout)
+                if response.status_code == 409:
+                    # We very likely won the race with our own earlier attempt:
+                    # the server already has this result. Treat as success (R10).
+                    logger.warning(
+                        "Interaction %s already recorded server-side (409); "
+                        "treating as submitted.", submission.interactionId)
+                    try:
+                        return InteractionDTO.model_validate(response.json())
+                    except Exception:  # noqa: BLE001
+                        return InteractionDTO(id=submission.interactionId,
+                                              status="COMPLETED")
 
-            if response.status_code == 401:
-                raise AuthenticationError("Invalid worker token")
+                if response.status_code == 400:
+                    raise NashiumClientError(
+                        f"Server rejected the payload (400): {response.text[:500]}")
 
-            if response.status_code == 400:
-                raise NashiumClientError(f"Bad request: {response.text}")
+                if response.status_code >= 500:
+                    raise requests.exceptions.HTTPError(
+                        f"Server error {response.status_code}: {response.text[:200]}")
 
-            if response.status_code == 409:
-                raise NashiumClientError(f"Conflict: Interaction state changed")
+                response.raise_for_status()
+                return InteractionDTO.model_validate(response.json())
 
-            response.raise_for_status()
+            except (AuthenticationError, NashiumClientError):
+                raise
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.HTTPError) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    backoff = 2 ** attempt
+                    logger.warning("Submit failed (%s); retrying in %ss", e, backoff)
+                    time.sleep(backoff)
 
-            data = response.json()
-            return InteractionDTO.model_validate(data)
-
-        except requests.exceptions.ConnectionError as e:
-            raise NashiumClientError(f"Connection failed: {e}") from e
-        except requests.exceptions.Timeout as e:
-            raise NashiumClientError(f"Request timed out: {e}") from e
-        except requests.exceptions.HTTPError as e:
-            raise NashiumClientError(f"HTTP error: {e}") from e
+        raise NashiumClientError(f"Failed to submit result: {last_error}") from last_error
 
     def health_check(self) -> bool:
         """
