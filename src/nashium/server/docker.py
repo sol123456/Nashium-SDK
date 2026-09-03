@@ -799,15 +799,20 @@ def run_match(
                         config=docker_config) as leaderboard:
 
         submitted_wins = 0
-        last_submitted: int | None = None
-        last_lead_effective: int | None = None
+        last_submitted_inverted: int | None = None
+        last_lead_raw: int | None = None
 
         for rnd in range(1, config.rounds + 1):
-            s_move = submitted.get_move(last_lead_effective)
-            l_raw = leaderboard.get_move(last_submitted)
-            l_move = 1 - l_raw  # inversion makes the game zero-sum
+            # Submitted bot sees Leaderboard's raw move (Challenger sees Defender)
+            s_move = submitted.get_move(last_lead_raw)
+            # Leaderboard bot sees Submitted's inverted move (Defender sees inverted Challenger)
+            l_raw = leaderboard.get_move(last_submitted_inverted)
 
-            if s_move == l_move:
+            # The Submitted bot acts as the Matcher.
+            # l_move is kept as the effective Leaderboard output for metric tracking.
+            l_move = l_raw
+
+            if s_move == l_raw:
                 submitted_wins += 1
 
             if capture_history:
@@ -815,8 +820,8 @@ def run_match(
                 lead_raw_hist.append(l_raw)
                 lead_eff_hist.append(l_move)
 
-            last_submitted = s_move
-            last_lead_effective = l_move
+            last_submitted_inverted = 1 - s_move
+            last_lead_raw = l_raw
 
             if capture_history and (rnd % sample_interval == 0 or rnd == config.rounds):
                 c, m = _snapshot(submitted, cpu_budget, mem_budget)

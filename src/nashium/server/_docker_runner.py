@@ -195,6 +195,14 @@ def load_bot(code: str, seed: int | None = None):
     ns = {"__name__": "__bot__", "RoundState": RoundState}
     exec(compile(code, "<bot>", "exec"), ns)
 
+    # 1. Prefer create_bot(seed) to match the frontend bot templates exactly
+    if "create_bot" in ns and callable(ns["create_bot"]):
+        bot = ns["create_bot"](seed)
+        if not callable(getattr(bot, "move", None)):
+            raise ValueError("create_bot() must return an object with a move(state) method.")
+        return bot
+
+    # 2. Fallback to finding a class named 'Bot' (or any class with a move() method)
     cls = ns.get("Bot")
     if not isinstance(cls, type):
         cls = None
@@ -206,7 +214,7 @@ def load_bot(code: str, seed: int | None = None):
                 break
     if cls is None:
         raise ValueError(
-            "No Bot class found. Define a class named 'Bot' with a 'move(state)' method."
+            "No Bot class found. Define a 'create_bot(seed)' function or a class named 'Bot' with a 'move(state)' method."
         )
 
     bot = _construct(cls, seed)
