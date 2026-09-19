@@ -74,8 +74,8 @@ class _Pending:
     first_failure_at: float = field(default_factory=time.monotonic)
 
     @property
-    def interaction_id(self) -> int:
-        return self.claimed.interaction.id
+    def submatch_id(self) -> int:
+        return self.claimed.subMatch.id
 
 
 # --------------------------------------------------------------------- format
@@ -117,7 +117,7 @@ def _build_runtime_stats_dto(
         maxMemory=float(runtime.memory_bytes_peak) if runtime.memory_bytes_peak else None,
         endCpuTime=runtime.elapsed_time_seconds,
         cpuUsageSamples=list(runtime.cpu_usage_samples) or None,
-        ramUsageSamples=list(runtime.ram_usage_samples) or None,
+        ramUsageSamples=list(runtime.ramUsageSamples) if hasattr(runtime, 'ramUsageSamples') else list(runtime.ram_usage_samples) or None,
         moves=list(moves) or None,
         performance=list(performance) or None,
         wins=stats.wins if stats else None,
@@ -128,16 +128,14 @@ def _build_runtime_stats_dto(
     )
 
 
-def _to_submission(interaction_id: int, result: MatchResult) -> MatchResultSubmissionDTO:
+def _to_submission(submatch_id: int, result: MatchResult) -> MatchResultSubmissionDTO:
     leaderboard_performance = tuple(1 - x for x in result.submitted_performance)
     return MatchResultSubmissionDTO(
-        interactionId=interaction_id,
-        seed=result.seed,
-        submitted_wins=result.submitted_wins,
-        submitted=_build_runtime_stats_dto(
+        subMatchId=submatch_id,
+        botA=_build_runtime_stats_dto(
             result.submitted, result.submitted_stats,
             result.submitted_moves, result.submitted_performance),
-        leaderboard=_build_runtime_stats_dto(
+        botB=_build_runtime_stats_dto(
             result.leaderboard, result.leaderboard_stats,
             result.leaderboard_moves_effective, leaderboard_performance),
     )
@@ -187,12 +185,12 @@ class Worker:
         level = (logging.ERROR if pending.attempts >= self.config.escalate_after_attempts
                  else logging.WARNING)
         logger.log(level,
-                   "BLOCKED on interaction %s (attempt %d, stuck %.0fs): %s",
-                   pending.interaction_id, pending.attempts, stuck_for, reason)
+                   "BLOCKED on SubMatch %s (attempt %d, stuck %.0fs): %s",
+                   pending.submatch_id, pending.attempts, stuck_for, reason)
         logger.log(level,
-                   "  interaction %s stays EXECUTING and no other match will be "
+                   "  SubMatch %s stays EXECUTING and no other match will be "
                    "claimed. Retrying in %.0fs.",
-                   pending.interaction_id, self.config.retry_interval_seconds)
+                   pending.submatch_id, self.config.retry_interval_seconds)
 
         # If the daemon restarted, the pooled client connections are dead.
         reset_client()
@@ -207,14 +205,13 @@ class Worker:
                     elapsed: float) -> None:
         cfg = self.match_config
         s, l = result.submitted, result.leaderboard
-        sub = pending.claimed.submittedBot.name or f"bot#{pending.claimed.submittedBot.id}"
-        lead = (pending.claimed.leaderboardBot.name
-                or f"bot#{pending.claimed.leaderboardBot.id}")
+        sub = pending.claimed.botA.name or f"bot#{pending.claimed.botA.id}"
+        lead = pending.claimed.botB.name or f"bot#{pending.claimed.botB.id}"
         losses = result.rounds - result.submitted_wins
         overhead = max(0.0, elapsed - s.wall_seconds - l.wall_seconds)
 
-        logger.info("Match %s finished in %.1fs | %s %dW-%dL %s (%.2f%%)",
-                    pending.interaction_id, elapsed, sub,
+        logger.info("SubMatch %s finished in %.1fs | %s %dW-%dL %s (%.2f%%)",
+                    pending.submatch_id, elapsed, sub,
                     result.submitted_wins, losses, lead,
                     result.submitted_win_rate * 100.0)
         logger.info("  cpu    | %s %6.2fs (%s of %.0fs) | %s %6.2fs (%s of %.0fs)"
@@ -261,18 +258,18 @@ class Worker:
         if claimed is None:
             return None
         pending = _Pending(claimed=claimed)
-        sub = claimed.submittedBot.name or f"bot#{claimed.submittedBot.id}"
-        lead = claimed.leaderboardBot.name or f"bot#{claimed.leaderboardBot.id}"
-        logger.info("Match %s claimed | %s vs %s | seed=%s | %d rounds",
-                    pending.interaction_id, sub, lead,
-                    claimed.interaction.seed, self.config.rounds)
+        sub = claimed.botA.name or f"bot#{claimed.botA.id}"
+        lead = claimed.botB.name or f"bot#{claimed.botB.id}"
+        logger.info("SubMatch %s claimed | %s vs %s | seed=%s | %d rounds",
+                    pending.submatch_id, sub, lead,
+                    claimed.subMatch.seed, self.config.rounds)
         return pending
 
     def _execute(self, pending: _Pending) -> bool:
         """Run the match. Returns False if blocked by a harness fault."""
-        interaction = pending.claimed.interaction
+        sub_match = pending.claimed.subMatch
 
-        if interaction.seed is None:
+        if sub_match.seed is None:
             # Cannot execute, and must not skip. Block until an operator fixes it.
             self._blocked(pending,
                           "server supplied no seed - this needs operator "
@@ -282,15 +279,15 @@ class Worker:
         # Bot code is passed through verbatim, including a poem. The container
         # fails to compile it, faults, and defaults to 0 for the whole match.
         # One code path for every kind of bad bot.
-        submitted_code = pending.claimed.submittedBot.code or ""
-        leaderboard_code = pending.claimed.leaderboardBot.code or ""
+        submitted_code = pending.claimed.botA.code or ""
+        leaderboard_code = pending.claimed.botB.code or ""
 
         start = time.perf_counter()
         try:
             result = run_match_result_from_code_strings(
                 submitted_code=submitted_code,
                 leaderboard_code=leaderboard_code,
-                seed=interaction.seed,
+                seed=sub_match.seed,
                 config=self.match_config,
                 capture_history=True,
             )
@@ -298,15 +295,15 @@ class Worker:
             self._blocked(pending, str(e))
             return False
         except Exception as e:  # noqa: BLE001
-            logger.exception("Unexpected harness failure on interaction %s",
-                             pending.interaction_id)
+            logger.exception("Unexpected harness failure on SubMatch %s",
+                             pending.submatch_id)
             self._blocked(pending, f"{type(e).__name__}: {e}")
             return False
 
         elapsed = time.perf_counter() - start
         self._log_report(pending, result, elapsed)
         pending.result = result
-        pending.submission = _to_submission(pending.interaction_id, result)
+        pending.submission = _to_submission(pending.submatch_id, result)
         return True
 
     def _submit(self, pending: _Pending) -> bool:
@@ -319,8 +316,8 @@ class Worker:
                           f"could not submit the completed result: {e} "
                           f"(the match will NOT be re-run)")
             return False
-        logger.info("Match %s submitted | status=%s result=%s",
-                    updated.id, updated.status, updated.result)
+        logger.info("SubMatch %s submitted | resolution=%s",
+                    updated.id, updated.resolution)
         return True
 
     # -------------------------------------------------------------------- run
@@ -332,7 +329,7 @@ class Worker:
             return False
         if not self._execute(pending):
             raise MatchExecutionError(
-                f"Could not execute interaction {pending.interaction_id}")
+                f"Could not execute SubMatch {pending.submatch_id}")
         self._submit(pending)
         return True
 
@@ -407,8 +404,8 @@ class Worker:
 
         if self._pending is not None:
             logger.warning("=" * 74)
-            logger.warning("Stopping with interaction %s still incomplete.",
-                           self._pending.interaction_id)
+            logger.warning("Stopping with SubMatch %s still incomplete.",
+                           self._pending.submatch_id)
             logger.warning("It remains EXECUTING server-side and was NOT scored. "
                            "It will need requeueing or another worker.")
             logger.warning("=" * 74)

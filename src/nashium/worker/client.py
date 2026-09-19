@@ -7,16 +7,16 @@ from __future__ import annotations
 import logging
 from typing import Optional
 from urllib.parse import urljoin
+import time
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import time
 
 from .models import (
     NextQueuedInteractionDTO,
     MatchResultSubmissionDTO,
-    InteractionDTO,
+    SubMatchDTO,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class NashiumClient:
         # Auto-retry only idempotent GETs. Retrying POST /claim-next after a
         # lost 200 claims a second interaction and strands the first (R18).
         # POST /result is retried explicitly below - it is keyed by
-        # interactionId, so repeating it is safe.
+        # subMatchId, so repeating it is safe.
         self.session = requests.Session()
         self.session.mount("http://", HTTPAdapter(max_retries=Retry(
             total=max_retries, backoff_factor=1,
@@ -127,9 +127,6 @@ class NashiumClient:
             if warning:
                 logger.warning(f"Server warning: {warning}")
 
-            if dto.warningMessage:
-                logger.warning(f"Server warning: {dto.warningMessage}")
-
             return dto
 
         except requests.exceptions.ConnectionError as e:
@@ -141,7 +138,7 @@ class NashiumClient:
                 raise NashiumClientError(f"HTTP error: {e}") from e
             raise
 
-    def submit_result(self, submission: MatchResultSubmissionDTO) -> InteractionDTO:
+    def submit_result(self, submission: MatchResultSubmissionDTO) -> SubMatchDTO:
         """
         Submit match results to the server.
 
@@ -149,7 +146,7 @@ class NashiumClient:
             submission: The match result data.
 
         Returns:
-            The updated InteractionDTO.
+            The updated SubMatchDTO.
 
         Raises:
             AuthenticationError: If the worker token is invalid.
@@ -170,13 +167,13 @@ class NashiumClient:
                     # We very likely won the race with our own earlier attempt:
                     # the server already has this result. Treat as success (R10).
                     logger.warning(
-                        "Interaction %s already recorded server-side (409); "
-                        "treating as submitted.", submission.interactionId)
+                        "SubMatch %s already recorded server-side (409); "
+                        "treating as submitted.", submission.subMatchId)
                     try:
-                        return InteractionDTO.model_validate(response.json())
+                        return SubMatchDTO.model_validate(response.json())
                     except Exception:  # noqa: BLE001
-                        return InteractionDTO(id=submission.interactionId,
-                                              status="COMPLETED")
+                        # Bypasses normal structural requirements and builds a bare minimum return.
+                        return SubMatchDTO.model_construct(id=submission.subMatchId)
 
                 if response.status_code == 400:
                     raise NashiumClientError(
@@ -187,7 +184,7 @@ class NashiumClient:
                         f"Server error {response.status_code}: {response.text[:200]}")
 
                 response.raise_for_status()
-                return InteractionDTO.model_validate(response.json())
+                return SubMatchDTO.model_validate(response.json())
 
             except (AuthenticationError, NashiumClientError):
                 raise
