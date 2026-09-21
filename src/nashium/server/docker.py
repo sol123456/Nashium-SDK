@@ -791,10 +791,14 @@ def run_match(
     lead_ram: list[int] = []
     sample_interval = max(1, int(config.rounds * 0.005))
 
-    with DockerExecutor(submitted_code, name="submitted", seed=seed,
+    # Split seed: first 4 bytes for submitted bot, last 4 bytes for leaderboard bot
+    seed_submitted = (seed >> 32) & 0xFFFFFFFF
+    seed_leaderboard = seed & 0xFFFFFFFF
+
+    with DockerExecutor(submitted_code, name="submitted", seed=seed_submitted,
                         cpu_limit=cpu_budget, wall_limit=wall_budget,
                         config=docker_config) as submitted, \
-         DockerExecutor(leaderboard_code, name="leaderboard", seed=seed,
+         DockerExecutor(leaderboard_code, name="leaderboard", seed=seed_leaderboard,
                         cpu_limit=cpu_budget, wall_limit=wall_budget,
                         config=docker_config) as leaderboard:
 
