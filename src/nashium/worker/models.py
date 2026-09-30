@@ -58,7 +58,7 @@ class MatchDTO(BaseModel):
     winnerBotName: Optional[str] = None
     botASpoilsProtected: Optional[bool] = None
     botBSpoilsProtected: Optional[bool] = None
-    spoilsEligible: bool
+    spoilsEligible: Optional[bool] = None
     spoilsGranted: bool
     userAPreRating: Optional[float] = None
     userAPreRd: Optional[float] = None
@@ -92,7 +92,7 @@ class BotDTO(BaseModel):
     code: str
     status: str
     kind: str
-    codePrivacyPurchased: bool
+    codePrivacyPurchased: Optional[bool] = None
     createdAt: datetime
     lastEditedAt: Optional[datetime] = None
     finalizedAt: Optional[datetime] = None
