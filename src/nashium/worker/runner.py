@@ -14,6 +14,7 @@ Two fault classes, two behaviours:
 from __future__ import annotations
 
 import logging
+import random
 import signal
 import sys
 import threading
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WorkerConfig:
-    api_base_url: str = "http://localhost:8080"
+    api_base_url: str = "https://nashium.com"
     worker_token: str = ""
 
     rounds: int = 10_000
@@ -60,6 +61,7 @@ class WorkerConfig:
     escalate_after_attempts: int = 4
 
     log_level: str = "INFO"
+    worker_name: str = ""
 
 
 @dataclass
@@ -117,7 +119,7 @@ def _build_runtime_stats_dto(
         maxMemory=float(runtime.memory_bytes_peak) if runtime.memory_bytes_peak else None,
         endCpuTime=runtime.elapsed_time_seconds,
         cpuUsageSamples=list(runtime.cpu_usage_samples) or None,
-        ramUsageSamples=list(runtime.ramUsageSamples) if hasattr(runtime, 'ramUsageSamples') else list(runtime.ram_usage_samples) or None,
+        ramUsageSamples=list(runtime.ram_usage_samples) or None,
         moves=list(moves) or None,
         performance=list(performance) or None,
         wins=stats.wins if stats else None,
@@ -158,17 +160,24 @@ class Worker:
         self._pending: Optional[_Pending] = None
         self._stop = threading.Event()
 
+        if config.worker_name:
+            fmt = f"%(asctime)s [%(levelname)s] [{config.worker_name}] %(message)s"
+        else:
+            fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
         logging.basicConfig(
             level=getattr(logging, config.log_level.upper()),
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            format=fmt,
             datefmt="%Y-%m-%d %H:%M:%S",
+            force=True,
         )
 
     # --------------------------------------------------------------- plumbing
 
-    def _sleep(self, seconds: float) -> None:
-        """Interruptible sleep, so SIGTERM does not wait out a 30s backoff."""
-        self._stop.wait(seconds)
+    def _sleep(self, seconds: float, *, jitter: float = 0.0) -> None:
+        """Interruptible sleep with optional ±jitter fraction."""
+        if seconds > 0 and jitter > 0:
+            seconds = seconds * random.uniform(1.0 - jitter, 1.0 + jitter)
+        self._stop.wait(max(0.0, seconds))
 
     def _setup_signal_handlers(self) -> None:
         def handler(signum, _frame):
@@ -336,8 +345,10 @@ class Worker:
     def run_forever(self) -> None:
         self._setup_signal_handlers()
 
+        banner_title = (f"Nashium Worker ({self.config.worker_name}) starting"
+                        if self.config.worker_name else "Nashium Worker starting")
         logger.info("=" * 74)
-        logger.info("Nashium Worker starting")
+        logger.info(banner_title)
         logger.info("  API URL          : %s", self.config.api_base_url)
         logger.info("  Execution        : Docker (sandboxed; the only supported mode)")
         logger.info("  Rounds per match : %d", self.config.rounds)
@@ -358,7 +369,7 @@ class Worker:
                 logger.error("Retrying preflight in %.0fs.",
                              self.config.retry_interval_seconds)
                 reset_client()
-                self._sleep(self.config.retry_interval_seconds)
+                self._sleep(self.config.retry_interval_seconds, jitter=0.15)
         if self._stop.is_set():
             return
 
@@ -370,18 +381,18 @@ class Worker:
                 if self._pending is None:
                     self._pending = self._claim()
                     if self._pending is None:
-                        self._sleep(self.config.idle_poll_interval_seconds)
+                        self._sleep(self.config.idle_poll_interval_seconds, jitter=0.2)
                         continue
 
                 pending = self._pending
 
                 if pending.submission is None:
                     if not self._execute(pending):
-                        self._sleep(self.config.retry_interval_seconds)
+                        self._sleep(self.config.retry_interval_seconds, jitter=0.15)
                         continue
 
                 if not self._submit(pending):
-                    self._sleep(self.config.retry_interval_seconds)
+                    self._sleep(self.config.retry_interval_seconds, jitter=0.15)
                     continue
 
                 self._pending = None
@@ -396,11 +407,11 @@ class Worker:
                 # The server being unreachable is never a reason to give up.
                 logger.warning("Server unreachable (%s). Retrying in %.0fs.",
                                e, self.config.retry_interval_seconds)
-                self._sleep(self.config.retry_interval_seconds)
+                self._sleep(self.config.retry_interval_seconds, jitter=0.15)
 
             except Exception as e:  # noqa: BLE001
                 logger.exception("Unexpected worker error: %s", e)
-                self._sleep(self.config.retry_interval_seconds)
+                self._sleep(self.config.retry_interval_seconds, jitter=0.15)
 
         if self._pending is not None:
             logger.warning("=" * 74)

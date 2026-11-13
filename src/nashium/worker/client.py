@@ -55,12 +55,16 @@ class NashiumClient:
         Initialize the client.
 
         Args:
-            base_url: Base URL of the JHipster server (e.g., "http://localhost:8080")
+            base_url: Base URL of the JHipster server (e.g., "https://nashium.com")
             worker_token: The X-Worker-Token for authentication
             timeout: Request timeout in seconds
             max_retries: Number of retries for failed requests
         """
-        self.base_url = base_url.rstrip("/")
+        base_url = base_url.strip().rstrip("/")
+        if base_url and "://" not in base_url:
+            scheme = "http" if base_url.startswith(("localhost", "127.0.0.1")) else "https"
+            base_url = f"{scheme}://{base_url}"
+        self.base_url = base_url
         self.worker_token = worker_token
         self.timeout = timeout
 

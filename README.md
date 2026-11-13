@@ -1,128 +1,94 @@
-# Nashium Server Runner
+# Nashium SDK & Match Worker
 
-Worker for executing Nashium competition matches in Docker containers.
-
-This is the server-side component that runs matches between submitted bots and leaderboard bots using Docker containerization for isolation and resource management.
+Sandboxed match runner and worker for executing Nashium competition matches in Docker containers against **`https://nashium.com`**.
 
 ---
 
-## New machine (Windows or Mac)
+## Quick Start (WSL2 or Linux)
 
-See **[GETTING_STARTED.md](GETTING_STARTED.md)** — clone, run `python scripts/bootstrap.py --setup-only`, then start workers.
-
-Do not wrap the worker in Docker. Docker is only for isolated bot matches.
-
-## Installation
-
-Before installing, make sure you are in the correct directory:
+See **[GETTING_STARTED.md](GETTING_STARTED.md)** for full new-machine setup instructions.
 
 ```bash
-cd Nashium-SDK
+# First-time setup (.venv + nashium-runner:latest image)
+python3 scripts/bootstrap.py --setup-only
+
+# Launch 6 workers in the interactive per-worker tabbed console
+python3 scripts/bootstrap.py --fast --token YOUR_TOKEN --workers 6
 ```
 
-Then install the package:
+Do **not** wrap the worker itself in Docker — each worker runs on the Linux/WSL2 host and spawns isolated Docker containers per bot match.
+
+---
+
+## Manual Installation
+
+From the repository root (inside WSL2 or Linux):
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
+docker build -t nashium-runner:latest src/nashium/server/
 ```
 
 ---
 
 ## Usage
 
-The worker connects to a Nashium server API to claim and execute matches.
+### Running Workers
+
+Single worker:
+
+```bash
+nashium-worker --token YOUR_TOKEN
+```
+
+Multiple workers (opens the per-worker tabbed console with `1`–`9` tab switching, **120s safe `Ctrl+C` drain**, and **`/kill`** instant force-kill):
+
+```bash
+nashium-worker --token YOUR_TOKEN --workers 6
+```
+
+Single match mode (claim and execute at most one match, then exit):
+
+```bash
+nashium-worker --single --token YOUR_TOKEN
+```
 
 ### Environment Variables
 
-- `NASHIUM_API_URL` - Base URL of the Nashium server (default: `http://localhost:8080`)
-- `NASHIUM_WORKER_TOKEN` - Authentication token for the worker API (required)
-- `NASHIUM_SEED_SECRET` - Secret key for deterministic seed generation (required)
-- `NASHIUM_ROUNDS` - Number of rounds per match (default: `10000`)
-- `NASHIUM_MAX_TIME` - Max CPU time per bot in seconds (default: `100.0`)
-- `NASHIUM_POLL_INTERVAL` - Seconds between polls when work is available (default: `2.0`)
-- `NASHIUM_IDLE_INTERVAL` - Seconds between polls when idle (default: `10.0`)
-- `NASHIUM_LOG_LEVEL` - Logging level (default: `INFO`)
+- `NASHIUM_API_URL` — Base URL of the Nashium server (default: `https://nashium.com`)
+- `NASHIUM_WORKER_TOKEN` — Authentication token for the worker API (required)
+- `NASHIUM_ROUNDS` — Number of rounds per match (default: `10000`)
+- `NASHIUM_MAX_TIME` — Max CPU time per bot in seconds (default: `100.0`)
+- `NASHIUM_MAX_WALL` — Wall-clock hang guard per bot in seconds (default: `300.0`)
+- `NASHIUM_MAX_MEMORY_MB` — Memory limit per bot container in MB (default: `200`)
+- `NASHIUM_IDLE_INTERVAL` — Seconds between polls when idle, ±20% jitter (default: `10.0`)
+- `NASHIUM_LOG_LEVEL` — Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`)
+- `NASHIUM_WORKER_NAME` — Optional worker tag for logs, e.g. `W1`
 
-### Running the Worker
+### CLI Options (`nashium-worker`)
 
-```bash
-nashium-worker --api-url http://localhost:8080 --token YOUR_TOKEN --seed-secret YOUR_SECRET
-```
-
-Or with environment variables:
-
-```bash
-export NASHIUM_API_URL=http://localhost:8080
-export NASHIUM_WORKER_TOKEN=xxx
-export NASHIUM_SEED_SECRET=yyy
-nashium-worker
-```
-
-### WSL2 Note
-
-If running in WSL2 and the Nashium server is on Windows, use the `--wsl-host` flag to auto-detect the Windows host IP:
-
-```bash
-nashium-worker --wsl-host --token "xxx" --seed-secret "yyy"
-```
-
-### Single Match Mode
-
-For testing, run a single match and exit:
-
-```bash
-nashium-worker --single --api-url http://localhost:8080 --token YOUR_TOKEN --seed-secret YOUR_SECRET
-```
-
----
-
-## Docker Setup
-
-The worker uses Docker for sandboxed execution. Make sure Docker is installed and running.
-
-Build the Docker image:
-
-```bash
-cd src/nashium/server
-docker build -t nashium-runner:latest .
-```
-
----
-
-## Configuration
-
-The worker can be configured with the following command-line options:
-
-- `--api-url` - Base URL of the Nashium server
-- `--token` - Worker authentication token (required)
-- `--seed-secret` - Secret key for seed generation (required)
-- `--rounds` - Number of rounds per match (default: `10000`)
-- `--max-time` - Max CPU time per bot in seconds (default: `100.0`)
-- `--poll-interval` - Seconds between polls when work is available (default: `2.0`)
-- `--idle-interval` - Seconds between polls when idle (default: `10.0`)
-- `--log-level` - Logging level (default: `INFO`)
-- `--wsl-host` - Auto-detect WSL2 host IP for API URL
-- `--single` - Run a single match and exit (for testing)
+- `--api-url` — Base URL of the Nashium server (default: `https://nashium.com`)
+- `--token` — Worker authentication token
+- `--workers` — Number of worker processes to supervise (default: `1`)
+- `--shutdown-timeout` — Seconds to wait for in-flight matches on shutdown before force-killing (default: `120`)
+- `--tabs` / `--plain` / `--wt-tabs` — Force tabbed TUI, combined stream, or native Windows Terminal WSL2 tabs
+- `--name` — Optional worker name shown in logs
+- `--rounds` — Number of rounds per match (default: `10000`)
+- `--max-time` — Max CPU time per bot in seconds (default: `100.0`)
+- `--max-wall` — Wall-clock hang guard per bot in seconds (default: `300.0`)
+- `--max-memory-mb` — Max RAM per bot in MB (default: `200`)
+- `--idle-interval` — Idle poll interval in seconds (default: `10.0`)
+- `--log-level` — Logging level (default: `INFO`)
+- `--wsl-host` — Resolve API host to the WSL2 default gateway (only for local dev against a server running on the Windows host)
+- `--single` — Claim and run at most one match, then exit
 
 ---
 
 ## Architecture
 
-The worker consists of:
-
-- **Worker** - Main loop that polls for work, executes matches, and submits results
-- **NashiumClient** - HTTP client for communicating with the server API
-- **DockerExecutor** - Executes bot code in isolated Docker containers
-- **DockerBackend** - Backend abstraction for Docker-based match execution
-
----
-
-## Match Execution
-
-1. Worker polls server for next queued interaction
-2. Retrieves bot code for both submitted and leaderboard bots
-3. Validates bot code syntax
-4. Generates deterministic seed from bot codes and secret
-5. Executes match in Docker containers with resource limits
-6. Collects runtime statistics (CPU, memory usage)
-7. Submits results to server API
+- **`Worker` (`nashium.worker.runner`)** — Claims matches, runs them in Docker, caches completed results until submitted, and blocks/retries on harness faults without stranding or skipping matches
+- **`WorkerSupervisor` (`nashium.worker.supervisor`)** — Multi-worker launcher with staggered startup, per-worker log tabs, 120s graceful drain, and `/kill` instant force-kill + container reaper
+- **`NashiumClient` (`nashium.worker.client`)** — HTTP client for `/api/worker/claim-next` and `/api/worker/result`
+- **`DockerExecutor` (`nashium.server.docker`)** — Executes untrusted bot code in network-disabled, read-only, resource-capped Docker containers over Unix domain sockets

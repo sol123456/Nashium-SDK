@@ -1,92 +1,84 @@
-# Getting Nashium workers onto another PC
+# Getting Nashium workers running on a PC
 
-You do **not** want Docker-in-Docker. One worker process on the host, Docker only for sandboxed bot matches.
+Workers run on the host (inside **WSL2** on Windows, or directly on Linux) and use Docker only to sandbox individual bot matches — never Docker-in-Docker.
 
-**Recommendation:** one Python process per worker (what you already do). To run 6, either open 6 terminals or:
+To start 6 workers with a **dedicated tab per worker** from a single command:
 
 ```bash
-python scripts/bootstrap.py --token YOUR_TOKEN --workers 6
+python3 scripts/bootstrap.py --token YOUR_TOKEN --workers 6
 ```
 
-Logs from all workers mix in one window. If you want separate consoles, open 6 terminals and run `nashium-worker` in each.
+After the first setup, add `--fast` (or run `.venv/bin/nashium-worker --token YOUR_TOKEN --workers 6`) to skip `pip install` and `docker build` and launch immediately.
 
 ---
 
-## What you need on every machine
+## Multi-worker tabbed console & safe shutdown
 
-1. **Python 3.10+**  
-   - Windows: https://www.python.org/downloads/ — tick “Add python.exe to PATH”  
-   - macOS: `brew install python` or the python.org installer
-2. **Docker Desktop** (must be running)  
-   - https://docs.docker.com/get-docker/  
-   - Windows: WSL2 backend is fine.  
-   - macOS: grant Docker the usual permissions.
-3. **Git** — https://git-scm.com/
+When `--workers` is 2 or more, `bootstrap.py` opens an interactive tabbed console right inside your Windows Terminal / WSL2 tab:
+
+- **`1`–`9`**, **`Tab` / `Shift+Tab`**, or **`←` / `→`** — switch between individual worker tabs (`W1`, `W2`, …)
+- **`0`** (or **`a`**) — view combined logs from all workers
+- **`↑` / `↓`**, **`PgUp` / `PgDn`**, **`Home` / `End`** (or **`g`**) — scroll through a worker's history and return to live tail
+- **`Ctrl+C`** (or **`/stop` + Enter**) — **safe shutdown**: stops claiming new matches and gives workers up to **120 seconds** (`--shutdown-timeout 120`) to finish and submit any in-flight match so nothing is stranded in `EXECUTING` on `nashium.com`
+- **`/kill` + Enter** — **instant kill switch** (available anytime via `/` or during shutdown): immediately `SIGKILL`s all remaining worker processes and reaps their `nashium-runner` Docker containers
+
+*(Optional UI modes: `--plain` streams combined `[W1]`…`[WN]` logs without the TUI; `--wt-tabs` opens separate native Windows Terminal tabs via `wt.exe`.)*
 
 ---
 
-## First time on a new PC (Windows, Mac, or Linux)
+## What you need on a Windows PC
 
-In a terminal (PowerShell, cmd, Terminal.app, or WSL):
+1. **Windows Terminal + WSL2 (Ubuntu)**
+   ```powershell
+   wsl --install
+   ```
+   Run all git / Python / worker commands **inside your WSL2 Linux terminal** (not Windows PowerShell — Linux bot containers communicate with the worker over Linux `AF_UNIX` sockets).
+2. **Docker Desktop** (must be running, with **Settings → Resources → WSL Integration** enabled for your WSL2 distro)
+   - https://docs.docker.com/get-docker/
+3. **Python 3.10+ & Git inside WSL2**
+   ```bash
+   sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
+   ```
+
+*(Sizing tip: each active worker uses ~1 CPU core and up to ~400 MB of container RAM. Aim for `workers <= CPU cores - 1` — e.g. 6 workers on an 8-core CPU with ≥6–8 GB RAM available to WSL2.)*
+
+---
+
+## First time on a new PC (inside WSL2 or Linux)
 
 ```bash
 git clone https://github.com/sol123456/Nashium-SDK.git
 cd Nashium-SDK
-git checkout arena/16fc3c32-nashium-sdk
+python3 scripts/bootstrap.py --setup-only
 ```
 
-Use whatever branch you actually want. Then:
-
-```bash
-python scripts/bootstrap.py --setup-only
-```
-
-On Windows that is often `py scripts/bootstrap.py --setup-only`.
-
-This creates `.venv`, installs the SDK + the Docker Python library, and builds `nashium-runner:latest`.
+This creates `.venv`, installs `nashium-sdk` (including `docker`, `requests`, `pydantic`), and builds `nashium-runner:latest`.
 
 ---
 
 ## Run workers
 
 ```bash
-python scripts/bootstrap.py --token YOUR_TOKEN --workers 6
+python3 scripts/bootstrap.py --fast --token YOUR_TOKEN --workers 6
 ```
 
-WSL on Windows: the script adds `--wsl-host` automatically.
+Workers connect to **`https://nashium.com`** by default (override with `--api-url` or `NASHIUM_API_URL`).
 
-Or after setup, activate the venv yourself:
-
-**macOS / Linux / WSL**
+Or activate `.venv` directly:
 
 ```bash
 source .venv/bin/activate
-nashium-worker --token "YOUR_TOKEN"
+nashium-worker --token "YOUR_TOKEN" --workers 6
 ```
-
-**Windows PowerShell**
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-nashium-worker --token "YOUR_TOKEN"
-```
-
-If PowerShell blocks scripts: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
 ---
 
-## Updating another PC later
+## Updating later
 
 ```bash
 cd Nashium-SDK
 git pull
-python scripts/bootstrap.py --setup-only
+python3 scripts/bootstrap.py --setup-only
 ```
 
 Then start workers as above.
-
----
-
-## Why not nest Docker?
-
-The worker is a thin client: poll API → start bot containers → report results. Putting the worker in a container means mounting the Docker socket (`docker.sock`), extra permission issues on Mac/Windows, and no real benefit for “run 6 of these”. Multiple host processes sharing one Docker daemon is the simple path.

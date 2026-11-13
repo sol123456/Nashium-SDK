@@ -1,7 +1,7 @@
 """
 CLI entry point for the match worker.
 
-    python -m nashium.worker --api-url http://localhost:8080 --token YOUR_TOKEN
+    python -m nashium.worker --api-url https://nashium.com --token YOUR_TOKEN
 
 Environment variables:
     NASHIUM_API_URL, NASHIUM_WORKER_TOKEN, NASHIUM_ROUNDS,
@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--api-url",
-                   default=os.environ.get("NASHIUM_API_URL", "http://localhost:8080"))
+                   default=os.environ.get("NASHIUM_API_URL") or "https://nashium.com")
     p.add_argument("--token", default=os.environ.get("NASHIUM_WORKER_TOKEN", ""))
     p.add_argument("--rounds", type=int,
                    default=int(os.environ.get("NASHIUM_ROUNDS", "10000")))
@@ -60,11 +60,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level",
                    default=os.environ.get("NASHIUM_LOG_LEVEL", "INFO"),
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--name",
+                   default=os.environ.get("NASHIUM_WORKER_NAME", ""),
+                   help="Optional worker label shown in logs (e.g. W1)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of worker processes to launch (default: 1)")
+    p.add_argument("--shutdown-timeout", type=float, default=120.0,
+                   help="Graceful shutdown safety timeout in seconds before force-kill (default: 120)")
+    ui = p.add_mutually_exclusive_group()
+    ui.add_argument("--tabs", action="store_true",
+                    help="Use the interactive per-worker tabbed console")
+    ui.add_argument("--plain", action="store_true",
+                    help="Stream combined prefixed logs instead of the tabbed console")
+    ui.add_argument("--wt-tabs", action="store_true",
+                    help="Open separate native Windows Terminal WSL2 tabs via wt.exe")
     p.add_argument("--wsl-host", action="store_true",
-                   help="Resolve the API host to the WSL2 default gateway")
+                   help="Resolve the API host to the WSL2 default gateway (local dev only)")
     p.add_argument("--single", action="store_true",
                    help="Claim and run at most one match, then exit")
     return p
+
+
+def _single_worker_child_cmd(args: argparse.Namespace, api_url: str) -> list[str]:
+    cmd = [
+        sys.executable, "-m", "nashium.worker",
+        "--api-url", api_url,
+        "--token", args.token,
+        "--rounds", str(args.rounds),
+        "--max-time", str(args.max_time),
+        "--max-wall", str(args.max_wall),
+        "--max-memory-mb", str(args.max_memory_mb),
+        "--idle-interval", str(args.idle_interval),
+        "--log-level", args.log_level,
+    ]
+    if args.single:
+        cmd.append("--single")
+    return cmd
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -88,6 +119,32 @@ def main(argv: list[str] | None = None) -> int:
               "(--token or NASHIUM_WORKER_TOKEN)", file=sys.stderr)
         return 1
 
+    if args.workers < 1:
+        print("Error: --workers must be >= 1", file=sys.stderr)
+        return 1
+
+    if args.workers > 1 or args.tabs or args.wt_tabs:
+        from pathlib import Path
+        from .supervisor import run_supervised_workers
+
+        if args.wt_tabs:
+            ui_mode = "wt-tabs"
+        elif args.plain:
+            ui_mode = "plain"
+        elif args.tabs:
+            ui_mode = "tabs"
+        else:
+            ui_mode = "auto"
+
+        return run_supervised_workers(
+            worker_cmd=_single_worker_child_cmd(args, api_url),
+            count=args.workers,
+            cwd=Path.cwd(),
+            api_url=api_url,
+            shutdown_timeout=args.shutdown_timeout,
+            ui_mode=ui_mode,
+        )
+
     from .runner import Worker, WorkerConfig
 
     worker = Worker(WorkerConfig(
@@ -99,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         max_memory_per_bot=args.max_memory_mb * 1024 * 1024,
         idle_poll_interval_seconds=args.idle_interval,
         log_level=args.log_level,
+        worker_name=args.name,
     ))
 
     if args.single:

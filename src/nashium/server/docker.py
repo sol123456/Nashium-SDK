@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import struct
@@ -22,10 +23,11 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 
 import docker
-from docker.errors import ImageNotFound
+from docker.errors import ImageNotFound, NotFound
 
 from nashium.core.engine import MatchConfig
 from nashium.core.errors import MatchExecutionError
@@ -40,8 +42,13 @@ LABEL_ROLE_VALUE = "bot-runner"
 LABEL_INSTANCE = "com.nashium.worker-instance"
 
 # Unique per worker process, so concurrent workers on one host never reap each
-# other's live containers (R2).
-INSTANCE_ID = uuid.uuid4().hex
+# other's live containers (R2). Supervisors can supply a deterministic ID via
+# NASHIUM_WORKER_INSTANCE_ID so force-killed workers' containers can be reaped.
+INSTANCE_ID = os.environ.get("NASHIUM_WORKER_INSTANCE_ID") or uuid.uuid4().hex
+
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$"
+)
 
 SOCK_DIR_PREFIX = "nashium_"
 MAX_LOAD_RESPONSE = 1024 * 1024
@@ -116,18 +123,47 @@ def parse_memory_limit_bytes(limit: int | str | None) -> int | None:
 
 # ----------------------------------------------------------------- lifecycle
 
+def _parse_docker_timestamp(created: object) -> float | None:
+    """Parse a Docker container Created field (epoch or ISO-8601) to epoch seconds."""
+    if isinstance(created, (int, float)):
+        return float(created)
+    if not isinstance(created, str) or not created.strip():
+        return None
+    m = _ISO_TIMESTAMP_RE.match(created.strip())
+    if not m:
+        return None
+    base, tz = m.groups()
+    if not tz or tz == "Z":
+        tz_str = "+00:00"
+    elif len(tz) == 5:
+        tz_str = f"{tz[:3]}:{tz[3:]}"
+    else:
+        tz_str = tz
+    try:
+        norm_base = base.replace(" ", "T")
+        return datetime.fromisoformat(f"{norm_base}{tz_str}").timestamp()
+    except ValueError:
+        return None
+
+
 def cleanup_stale_containers(max_age_seconds: float = 900.0) -> int:
     """Reap bot containers abandoned by a crashed worker.
 
     Only touches containers older than max_age_seconds (a match cannot exceed
-    ~11 minutes) OR belonging to this worker instance. This keeps concurrent
+    ~13 minutes) OR belonging to this worker instance. This keeps concurrent
     workers on the same host from killing each other's live matches.
     """
     try:
         client = get_client()
+        # ignore_removed=True avoids 404 NotFound races when sibling workers
+        # tear down preflight or finished match containers concurrently.
         containers = client.containers.list(
-            all=True, filters={"label": f"{LABEL_ROLE}={LABEL_ROLE_VALUE}"}
+            all=True,
+            filters={"label": f"{LABEL_ROLE}={LABEL_ROLE_VALUE}"},
+            ignore_removed=True,
         )
+    except NotFound:
+        return 0
     except Exception as e:  # noqa: BLE001
         logger.warning("Could not list bot containers: %s", e)
         return 0
@@ -138,19 +174,15 @@ def cleanup_stale_containers(max_age_seconds: float = 900.0) -> int:
         try:
             labels = (c.attrs.get("Config") or {}).get("Labels") or {}
             mine = labels.get(LABEL_INSTANCE) == INSTANCE_ID
-            created = c.attrs.get("Created", "")
-            age = float("inf")
-            if created:
-                try:
-                    from datetime import datetime, timezone
-                    ts = created.split(".")[0].rstrip("Z")
-                    dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-                    age = now - dt.timestamp()
-                except (ValueError, TypeError):
-                    pass
+            created_ts = _parse_docker_timestamp(c.attrs.get("Created"))
+            # Fail-safe to age 0.0 on unparseable timestamps so a strange format
+            # never causes a worker to reap another live worker's container.
+            age = max(0.0, now - created_ts) if created_ts is not None else 0.0
             if mine or age > max_age_seconds:
                 c.remove(force=True)
                 removed += 1
+        except NotFound:
+            pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -188,6 +220,12 @@ def verify_environment(config: DockerConfig | None = None) -> None:
     """
     config = config or DockerConfig()
 
+    if os.name == "nt":
+        raise MatchExecutionError(
+            "Native Windows Python cannot share Unix sockets with Linux Docker "
+            "containers. Run the worker inside WSL2 instead."
+        )
+
     if not hasattr(socket, "AF_UNIX"):
         raise MatchExecutionError(
             "Unix sockets are unavailable. Run the worker from Linux or WSL2."
@@ -203,7 +241,8 @@ def verify_environment(config: DockerConfig | None = None) -> None:
         ) from e
 
     probe = "class Bot:\n    def move(self, state):\n        return 0\n"
-    ex = DockerExecutor(probe, name="preflight", seed=0, config=config)
+    preflight_cfg = replace(config, stats_enabled=False)
+    ex = DockerExecutor(probe, name="preflight", seed=0, config=preflight_cfg)
     try:
         if ex.faulted:
             raise MatchExecutionError(
