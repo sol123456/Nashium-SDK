@@ -6,6 +6,12 @@ This is the server-side component that runs matches between submitted bots and l
 
 ---
 
+## New machine (Windows or Mac)
+
+See **[GETTING_STARTED.md](GETTING_STARTED.md)** — clone, run `python scripts/bootstrap.py --setup-only`, then start workers.
+
+Do not wrap the worker in Docker. Docker is only for isolated bot matches.
+
 ## Installation
 
 Before installing, make sure you are in the correct directory:
