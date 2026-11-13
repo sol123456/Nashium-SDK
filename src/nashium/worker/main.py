@@ -48,6 +48,7 @@ def get_wsl_host_ip() -> str:
 
 def main():
     parser = argparse.ArgumentParser(
+        prog="nashium-worker",
         description="Nashium Match Worker - Executes matches for the competition",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -190,5 +191,5 @@ Example:
         worker.run_forever()
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()

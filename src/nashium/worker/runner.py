@@ -203,6 +203,14 @@ class Worker:
 
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
+        # "nashium farm" stops workers with CTRL_BREAK_EVENT on Windows,
+        # which Python delivers as SIGBREAK. Treat it like SIGINT.
+        sigbreak = getattr(signal, "SIGBREAK", None)
+        if sigbreak is not None:
+            try:
+                signal.signal(sigbreak, handler)
+            except (OSError, ValueError):
+                pass
 
     def _generate_seed(self, submitted_code: str, leaderboard_code: str) -> int:
         """Generate a secure deterministic seed for this match."""

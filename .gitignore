@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments (never commit these - they are machine specific)
+.venv/
+venv/
+env/
+ENV/
+
+# Nashium output
+logs/
+nashium_match_logs/
+
+# Secrets - tokens and seed secrets must never be committed
+farm.ini
+.env
+token.txt
+seed-secret.txt
+
+# IDE
+.idea/
+.vscode/

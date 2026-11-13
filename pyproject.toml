@@ -17,9 +17,14 @@ dependencies = [
     "pydantic>=2.0.0",
 ]
 
+[project.optional-dependencies]
+# Needed by `nashium-worker` / `nashium farm` to spawn match containers.
+worker = ["docker>=7.0.0"]
+
 [project.scripts]
 nashium = "nashium.cli:main"
 nashium-worker = "nashium.worker.main:main"
+nashium-farm = "nashium.farm.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

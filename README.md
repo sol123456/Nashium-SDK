@@ -39,6 +39,50 @@ pip install -e .
 
 ---
 
+## Running Match Workers
+
+If you run matches for the competition (rather than writing a bot), you do not
+need six terminals. One command runs the whole pool:
+
+```bash
+nashium farm --workers 6 --token "YOUR_TOKEN" --seed-secret "YOUR_SECRET"
+```
+
+Run that once per machine to remember the settings:
+
+```bash
+nashium farm --save-config --token "YOUR_TOKEN" --seed-secret "YOUR_SECRET"
+nashium farm --workers 6
+```
+
+Setup on a fresh machine is one script, which creates the virtualenv, installs
+the SDK and builds the runner image:
+
+```bash
+./scripts/setup.sh          # Windows: .\scripts\setup.ps1
+```
+
+What the farm gives you:
+
+- one colour-prefixed output stream per worker (`[w1]`, `[w2]`, ...);
+- one log file per worker under `logs/farm-<timestamp>/`;
+- automatic restart of a worker that dies, with backoff;
+- Ctrl-C that lets in-flight matches finish and submit instead of killing them;
+- pre-flight checks for docker, the runner image, your token and the server
+  (`nashium farm --check`);
+- `nashium farm --build-image` builds `nashium-runner:latest` from any directory,
+  replacing the manual `docker build -f src/nashium/server/Dockerfile ...`.
+
+**Set `--workers` to your core count, not higher.** Each worker runs one match =
+two containers at 0.5 CPU, and the 100 second bot budget is wall-clock, so
+oversubscribing makes good bots look timed out and the server records the worse
+result. The farm warns you if you go over.
+
+See **[docs/FARM.md](docs/FARM.md)** for the reasoning - including why the worker
+should *not* be put inside a Docker container.
+
+---
+
 
 ## Usage Guide
 
@@ -177,7 +221,7 @@ The following options are shared by **check**, **run**, and **qualify**:
 
 - `--docker` Run each bot in a Docker container (matches the server environment). 
   - Requires linux environment and running docker container. 
-  - Configure with `cd src/nashium/server` then `docker build -t nashium-runner:latest .`
+  - Configure with `cd src/nashium/server` then `docker build -t nashium-runner:latest .` (or, from anywhere, `nashium farm --build-image --check`)
 
 ---
 

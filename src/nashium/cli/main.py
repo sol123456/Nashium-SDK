@@ -11,6 +11,15 @@ from ..core.errors import BotLoadError, BotTimeoutError, InvalidMoveError
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # `nashium farm ...` is handled by its own parser so that it can accept
+    # flags this parser knows nothing about.
+    if argv and argv[0] == "farm":
+        from ..farm.main import main as farm_main
+
+        return farm_main(argv[1:] or ["--help"])
+
     parser = argparse.ArgumentParser(
         prog="nashium",
         description="Nashium SDK - Create and test your matching pennies bot",
@@ -22,6 +31,7 @@ Examples:
   nashium qualify my_bot.py --sandbox   Test in sandboxed subprocess
   nashium check my_bot.py               Verify your bot is deterministic
   nashium run bot_a.py bot_b.py         Run a match between two bots
+  nashium farm --workers 6              Run 6 match workers at once
         """
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -96,6 +106,11 @@ Examples:
         help="Directory to write saved match logs",
     )
     p_qualify.set_defaults(func=cmd_qualify)
+
+    # Farm: listed here so `nashium --help` mentions it. It has its own parser
+    # and is dispatched before argparse runs (see below), because a subparser
+    # cannot cleanly forward unknown options such as `nashium farm --workers 6`.
+    sub.add_parser("farm", help="Run several workers at once (options: nashium farm --help)")
 
     args = parser.parse_args(argv)
 
