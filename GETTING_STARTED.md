@@ -22,6 +22,19 @@ When `--workers` is 2 or more, `bootstrap.py` opens an interactive tabbed consol
 - **`Ctrl+C`** (or **`/stop` + Enter**) — **safe shutdown**: stops claiming new matches and gives workers up to **120 seconds** (`--shutdown-timeout 120`) to finish and submit any in-flight match so nothing is stranded in `EXECUTING` on `nashium.com`
 - **`/kill` + Enter** — **instant kill switch** (available anytime via `/` or during shutdown): immediately `SIGKILL`s all remaining worker processes and reaps their `nashium-runner` Docker containers
 
+### The overview stays open until *you* close it
+
+When the last worker stops — a crash, a revoked token, a finished drain, or `/kill` — the console no longer disappears with it. It freezes on a final overview and waits for you:
+
+- The top banner reports the outcome, e.g. `SESSION ENDED WITH ERRORS: 1/6 worker(s) failed (W3 rc=1)` (red) or `SESSION ENDED: all 6 worker(s) stopped cleanly` (green), plus how many matches were submitted and the total run time.
+- A worker that gave up on a fatal problem — a revoked token, a Python traceback — counts as an error even when it exited `0`: its tab badge reads `!err`, the banner names the cause, and the process exits `1` instead of pretending everything was fine.
+- Every worker keeps its tab with its final state (`rc=1`, `killed`, `done`), so nothing is lost. If a worker died badly, its tab is focused for you automatically.
+- All navigation still works while it is held: `1`–`9` / `Tab` / `0`, `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` to scroll back through up to 5 000 lines of that worker's history.
+- Close it whenever you are done with **`q`**, **`Esc`** or **`Ctrl+C`**. Only then does the process exit, with the usual exit code (`0` clean, `1` a worker failed, `130` force-killed).
+- As it closes, the last lines of every failed worker are echoed to `stderr`, so the post-mortem survives in your terminal scrollback too.
+
+For unattended or scripted runs, pass **`--auto-exit`** to get the old behaviour (the console closes by itself as soon as every worker has stopped). `--plain` mode never clears the screen, so its logs stay in the scrollback either way.
+
 *(Optional UI modes: `--plain` streams combined `[W1]`…`[WN]` logs without the TUI; `--wt-tabs` opens separate native Windows Terminal tabs via `wt.exe`.)*
 
 ---

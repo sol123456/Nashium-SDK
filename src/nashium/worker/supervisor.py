@@ -39,6 +39,10 @@ class WorkerSlot:
     completed: int = 0
     return_code: int | None = None
     force_killed: bool = False
+    # Set when the worker's own output shows it gave up on a fatal problem
+    # (revoked token, Python traceback). Such a worker can still exit 0, and
+    # the final overview must not report that as a clean stop.
+    fatal_error: str | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=5000))
     scroll_from_bottom: int = 0  # 0 = follow live tail
 
@@ -64,10 +68,20 @@ class WorkerSlot:
         if self.state == "killed":
             return "killed"
         if self.state == "stopped":
-            return "done"
+            return "!err" if self.fatal_error else "done"
         if self.state == "exited":
             return f"rc={self.return_code}"
         return self.state[:6]
+
+
+def _slot_fault(slot: WorkerSlot) -> str:
+    """Short human description of why a finished slot counts as a failure."""
+    rc = "n/a" if slot.return_code is None else str(slot.return_code)
+    if slot.fatal_error and slot.return_code in (0, None):
+        return f"{slot.name} {slot.fatal_error} (exit {rc})"
+    if slot.fatal_error:
+        return f"{slot.name} rc={rc} ({slot.fatal_error})"
+    return f"{slot.name} rc={rc}"
 
 
 class WorkerSupervisor:
@@ -83,6 +97,7 @@ class WorkerSupervisor:
         shutdown_timeout: float = 120.0,
         stagger_seconds: float = 0.4,
         echo_to_stdout: bool = False,
+        auto_exit: bool = False,
     ) -> None:
         self.worker_cmd = list(worker_cmd)
         self.count = max(1, count)
@@ -91,6 +106,11 @@ class WorkerSupervisor:
         self.shutdown_timeout = max(1.0, shutdown_timeout)
         self.stagger_seconds = max(0.0, stagger_seconds)
         self.echo_to_stdout = echo_to_stdout
+        # False (default): once every worker has stopped the overview is frozen
+        # on screen and stays there until the operator closes it, so crashes and
+        # error output can still be reviewed. True: legacy behaviour, the window
+        # closes by itself as soon as the last worker exits.
+        self.auto_exit = auto_exit
 
         self.started_at = time.monotonic()
         self.lock = threading.Lock()
@@ -220,6 +240,7 @@ class WorkerSupervisor:
             self._record_line(
                 slot,
                 f"[supervisor] {slot.name} exited (code={rc}"
+                f"{f', {slot.fatal_error}' if slot.fatal_error else ''}"
                 f"{', force-killed' if slot.force_killed else ''})",
             )
 
@@ -243,7 +264,17 @@ class WorkerSupervisor:
             print(out, flush=True)
 
     def _update_state_from_line(self, slot: WorkerSlot, line: str) -> None:
+        lowered = line.lower()
         with self.lock:
+            if slot.fatal_error is None:
+                # A worker that gives up on a fatal problem can still exit 0
+                # (an auth failure just breaks its loop), so remember it here -
+                # otherwise the final overview would report a clean session.
+                if "authentication failed" in lowered or "token is wrong or revoked" in lowered:
+                    slot.fatal_error = "auth failure"
+                elif "traceback (most recent call last)" in lowered:
+                    slot.fatal_error = "python traceback"
+
             if "Docker preflight OK" in line:
                 if slot.state == "booting":
                     slot.state = "draining" if self.shutting_down else "idle"
@@ -286,6 +317,42 @@ class WorkerSupervisor:
             if not self._launcher_done and not self.force_killed:
                 return False
             return all(not s.alive for s in self.slots)
+
+    def abnormal_slots(self) -> list[WorkerSlot]:
+        """Slots that ended badly: crashed, failed to start, or were force-killed.
+
+        Workers stopped by an operator (SIGTERM/SIGINT drain) are *not* abnormal,
+        which keeps the final banner honest after a deliberate Ctrl+C.
+        """
+        shutdown_signals = {0, -2, -15, 130, 143}
+        with self.lock:
+            out: list[WorkerSlot] = []
+            for s in self.slots:
+                if s.state in ("exited", "killed") or s.fatal_error:
+                    out.append(s)
+                elif s.state == "stopped" and (s.return_code or 0) not in shutdown_signals:
+                    out.append(s)
+            return out
+
+    def hold_banner(self) -> tuple[str, bool]:
+        """One-line summary shown while the finished overview is held on screen.
+
+        Returns (text, had_failures).
+        """
+        bad = self.abnormal_slots()
+        with self.lock:
+            total_done = sum(s.completed for s in self.slots)
+            uptime = _format_uptime(time.monotonic() - self.started_at)
+            reason = self.force_kill_reason
+        tail = f"{total_done} match(es) submitted in {uptime}"
+        if self.force_killed:
+            head = f"WORKERS FORCE-KILLED ({reason or 'unknown reason'})"
+        elif bad:
+            detail = ", ".join(_slot_fault(s) for s in bad)
+            head = f"SESSION ENDED WITH ERRORS: {len(bad)}/{self.count} worker(s) failed ({detail})"
+        else:
+            head = f"SESSION ENDED: all {self.count} worker(s) stopped cleanly"
+        return f" {head} | {tail} ", bool(bad) or self.force_killed
 
     def seconds_until_force_kill(self) -> float:
         with self.lock:
@@ -517,30 +584,112 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
     cmd_mode = False
     cmd_buf = ""
 
+    # ------------------------------------------------------- session-end hold
+    # When the last worker stops - crash, auth failure, drain, /kill - the
+    # overview is NOT torn down any more. It freezes on screen with every
+    # worker's final state and its full log history, so whatever happened can
+    # still be read, and it only closes when the operator dismisses it.
+    # `--auto-exit` restores the old "window vanishes with the last worker"
+    # behaviour for scripts and unattended runs.
+    CLOSE_KEYS = frozenset({3, 4, 27, ord("q"), ord("Q")})  # Ctrl+C, Ctrl+D, Esc, q
+    session_held = False
+    hold_focus_done = False
+
+    def _close_requested(ch: int) -> bool:
+        """True only when the operator *deliberately* dismissed the overview."""
+        if ch not in CLOSE_KEYS:
+            return False
+        if ch != 27:
+            return True
+        # A bare ESC is ambiguous: either a genuine Esc press, or the first byte
+        # of an escape sequence this terminal's terminfo does not map (arrow keys
+        # sent as CSI sequences while not in application-cursor mode, for
+        # instance). ncurses hands back the ESC and leaves the tail queued, so
+        # peek behind it: only close when nothing follows. Reviewing the logs
+        # must never be able to slam the window shut by accident.
+        stdscr.timeout(30)
+        nxt = stdscr.getch()
+        stdscr.timeout(50)
+        if nxt == -1:
+            return True
+        stdscr.nodelay(True)
+        try:
+            while stdscr.getch() != -1:
+                pass
+        except curses.error:
+            pass
+        finally:
+            stdscr.nodelay(False)
+            stdscr.timeout(50)
+        return False
+
+    def _enter_hold() -> None:
+        """Freeze the overview and focus the first worker that died badly."""
+        nonlocal session_held, cmd_mode, cmd_buf, selected_tab, hold_focus_done
+        session_held = True
+        cmd_mode = False
+        cmd_buf = ""
+        if hold_focus_done:
+            return
+        hold_focus_done = True
+        bad = sup.abnormal_slots()
+        if not bad:
+            return
+        with sup.lock:
+            current = (
+                sup.slots[selected_tab - 1] if 1 <= selected_tab <= sup.count else None
+            )
+        if current is not None and current.state in ("exited", "killed"):
+            return  # already looking at a failed worker
+        selected_tab = bad[0].index
+        sup.set_flash(
+            f"Showing {bad[0].name} - it stopped with an error. "
+            f"Press q or Ctrl+C to close this overview.",
+            duration=8.0,
+        )
+
     while True:
         if sig_triggered.is_set():
             sig_triggered.clear()
+            if session_held:
+                break  # Ctrl+C on a finished overview simply closes the window
             if sup.begin_graceful_shutdown():
                 cmd_buf = ""
             cmd_mode = True
 
+        finished_now = False
         if sup.shutting_down:
             if sup.all_finished():
-                break
-            if sup.seconds_until_force_kill() <= 0:
+                finished_now = True
+            elif sup.seconds_until_force_kill() <= 0:
                 sup.force_kill_all(reason=f"{int(sup.shutdown_timeout)}s safety timeout")
-                break
+                finished_now = True
         elif sup.all_finished():
-            break
+            finished_now = True
+
+        if finished_now and not session_held:
+            if sup.auto_exit:
+                break
+            _enter_hold()
 
         # ------------------------------ render
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         if height < 6 or width < 30:
-            safe_put(0, 0, "Terminal too small - enlarge window", curses.A_BOLD)
+            safe_put(
+                0,
+                0,
+                "Session ended - press q or Ctrl+C to close"
+                if session_held
+                else "Terminal too small - enlarge window",
+                curses.A_BOLD,
+            )
             stdscr.refresh()
             ch = stdscr.getch()
-            if ch == 3:
+            if session_held:
+                if _close_requested(ch):
+                    break
+            elif ch == 3:
                 sup.begin_graceful_shutdown()
             continue
 
@@ -552,8 +701,11 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
             uptime = _format_uptime(time.monotonic() - sup.started_at)
             flash = sup.flash_message if time.monotonic() < sup.flash_until else ""
 
-        # Row 0: Header / Shutdown banner
-        if sup.shutting_down:
+        # Row 0: Header / Shutdown banner / final session summary
+        if session_held:
+            banner, had_failures = sup.hold_banner()
+            fill_row(0, banner, cpair(7 if had_failures else 2, curses.A_BOLD))
+        elif sup.shutting_down:
             rem = sup.seconds_until_force_kill()
             banner = (
                 f" SAFE SHUTDOWN: waiting for {n_alive}/{sup.count} worker(s) to finish "
@@ -581,7 +733,7 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
                     attr = cpair(2, curses.A_BOLD)
                 elif s.state in ("draining", "booting"):
                     attr = cpair(3)
-                elif s.state in ("blocked", "exited", "killed"):
+                elif s.state in ("blocked", "exited", "killed") or s.fatal_error:
                     attr = cpair(4, curses.A_BOLD)
                 else:
                     attr = curses.A_NORMAL
@@ -650,7 +802,14 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
         visible = wrapped[start_idx:end_idx]
 
         if not visible:
-            safe_put(log_top, 1, "Waiting for worker output...", curses.A_DIM)
+            safe_put(
+                log_top,
+                1,
+                "No output was captured from this worker."
+                if session_held
+                else "Waiting for worker output...",
+                curses.A_DIM,
+            )
         else:
             for row_offset, ln in enumerate(visible):
                 line_attr = curses.A_NORMAL
@@ -697,7 +856,15 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
             fill_row(height - 2, status_line, curses.A_REVERSE)
 
         # Row height - 1: Help bar OR interactive /command bar
-        if sup.shutting_down or cmd_mode:
+        if session_held:
+            fill_row(
+                height - 1,
+                f" OVERVIEW KEPT OPEN (nothing is running) | q / Ctrl+C / Esc: close window | "
+                f"1-{min(9, sup.count)}/Tab: worker tabs | 0: all | "
+                f"Up/Dn/PgUp/PgDn/Home/End: review logs ",
+                cpair(6, curses.A_BOLD),
+            )
+        elif sup.shutting_down or cmd_mode:
             if sup.shutting_down:
                 prompt = " Type /kill + Enter to instantly murder all workers (Tab/0-9 switches tabs): "
             else:
@@ -719,6 +886,8 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
             continue
         if ch == curses.KEY_RESIZE:
             continue
+        if session_held and _close_requested(ch):
+            break  # operator dismissed the finished overview
         if ch == 3:  # Ctrl+C in raw/cbreak mode
             if sup.begin_graceful_shutdown():
                 cmd_buf = ""
@@ -781,6 +950,28 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
             cycle_tab(1)
             continue
 
+        # Session ended: the overview is frozen, so there is nothing left to
+        # command. Tab switching and log scrolling stay available for review;
+        # every other key (except the close keys handled above) is ignored.
+        if session_held:
+            if ord("0") <= ch <= ord("9"):
+                digit = ch - ord("0")
+                if digit == 0 or digit <= sup.count:
+                    selected_tab = digit
+            elif ch in (ord("a"), ord("A")):
+                selected_tab = 0
+            elif ch in (ord("g"), ord("G")):
+                adjust_scroll(0, to_bottom=True)
+            elif ch == ord("["):
+                cycle_tab(-1)
+            elif ch == ord("]"):
+                cycle_tab(1)
+            elif ch == ord("/"):
+                sup.set_flash(
+                    "Nothing is running - press q or Ctrl+C to close this overview."
+                )
+            continue
+
         # Command input handling (active after `/` or during shutdown)
         if cmd_mode or sup.shutting_down:
             # Allow 0-9 tab switching when command buffer is empty!
@@ -808,7 +999,12 @@ def _curses_loop(stdscr, sup: WorkerSupervisor, sig_triggered: threading.Event) 
                 cmd_buf = ""
                 if entered in ("/kill", "kill"):
                     sup.force_kill_all(reason="user /kill command")
-                    break
+                    if sup.auto_exit:
+                        break
+                    # Keep the frozen overview on screen so the operator can
+                    # still read what the workers did before they were killed.
+                    cmd_mode = False
+                    continue
                 if entered in ("/stop", "stop", "/quit", "quit"):
                     sup.begin_graceful_shutdown()
                     cmd_mode = True
@@ -1008,6 +1204,30 @@ def _can_use_curses() -> bool:
         return False
 
 
+def _print_failure_digest(sup: WorkerSupervisor, *, tail_lines: int = 15) -> None:
+    """Re-print the tail of every worker that ended badly.
+
+    The tabbed console now stays open until the operator closes it, but once it
+    does close the screen is cleared - so the interesting last lines of each
+    crashed / killed worker are echoed to stderr and survive in the terminal
+    scrollback for a post-mortem.
+    """
+    for s in sup.abnormal_slots():
+        with sup.lock:
+            lines = list(s.logs)[-tail_lines:]
+        if not lines:
+            continue
+        rc = "n/a" if s.return_code is None else str(s.return_code)
+        reason = f", {s.fatal_error}" if s.fatal_error else ""
+        print(
+            f"\n----- {s.name}: last {len(lines)} line(s), exit code {rc}{reason} -----",
+            file=sys.stderr,
+            flush=True,
+        )
+        for ln in lines:
+            print(f"[{s.name}] {ln}", file=sys.stderr, flush=True)
+
+
 def run_supervised_workers(
     *,
     worker_cmd: list[str],
@@ -1016,6 +1236,7 @@ def run_supervised_workers(
     api_url: str = "https://nashium.com",
     shutdown_timeout: float = 120.0,
     ui_mode: str = "auto",
+    auto_exit: bool = False,
 ) -> int:
     """Launch `count` workers in tabbed TUI, plain stream, or native WT tabs.
 
@@ -1024,6 +1245,13 @@ def run_supervised_workers(
       - "tabs"    : tabbed TUI (falls back to plain if non-TTY)
       - "plain"   : prefixed single-stream output with 120s drain + /kill on stdin
       - "wt-tabs" : spawn separate native Windows Terminal tabs via wt.exe
+
+    `auto_exit`:
+      - False (default): the tabbed console stays on screen after the last
+        worker stops - including after a crash - until the operator closes it
+        with `q`, `Esc` or `Ctrl+C`, so the final states and logs can be read.
+      - True: legacy behaviour, the console closes as soon as every worker has
+        exited (use this for unattended/scripted runs).
     """
     if ui_mode == "wt-tabs":
         return launch_windows_terminal_tabs(worker_cmd=worker_cmd, count=count, cwd=cwd)
@@ -1041,6 +1269,7 @@ def run_supervised_workers(
         api_url=api_url,
         shutdown_timeout=shutdown_timeout,
         echo_to_stdout=not use_tui,
+        auto_exit=auto_exit,
     )
 
     if use_tui:
@@ -1062,12 +1291,23 @@ def run_supervised_workers(
             f"Completed matches before exit: {total_completed}.",
             flush=True,
         )
+        if use_tui:
+            _print_failure_digest(sup)
         return 130
 
     failed = [s for s in sup.slots if (s.return_code or 0) != 0 and not sup.shutting_down]
-    if failed:
-        details = ", ".join(f"{s.name}(rc={s.return_code})" for s in failed)
+    # A worker can also give up on a fatal problem (revoked token, traceback)
+    # and still exit 0 - that is an error too, unless the operator stopped it.
+    bad: dict[int, WorkerSlot] = {s.index: s for s in failed}
+    if not sup.shutting_down:
+        for s in sup.slots:
+            if s.fatal_error:
+                bad.setdefault(s.index, s)
+    if bad:
+        details = ", ".join(_slot_fault(s) for s in bad.values())
         print(f"Workers exited with errors: {details}", file=sys.stderr, flush=True)
+        if use_tui:
+            _print_failure_digest(sup)
         return 1
 
     if sup.shutting_down and sup.shutdown_started_at is not None:

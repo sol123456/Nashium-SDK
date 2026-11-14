@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Number of worker processes to launch (default: 1)")
     p.add_argument("--shutdown-timeout", type=float, default=120.0,
                    help="Graceful shutdown safety timeout in seconds before force-kill (default: 120)")
+    p.add_argument("--auto-exit", action="store_true",
+                   help="Close the tabbed console as soon as the last worker stops "
+                        "(default: the overview stays on screen until you close it with "
+                        "q, Esc or Ctrl+C, so crashes and errors can be reviewed)")
     ui = p.add_mutually_exclusive_group()
     ui.add_argument("--tabs", action="store_true",
                     help="Use the interactive per-worker tabbed console")
@@ -143,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             api_url=api_url,
             shutdown_timeout=args.shutdown_timeout,
             ui_mode=ui_mode,
+            auto_exit=args.auto_exit,
         )
 
     from .runner import Worker, WorkerConfig

@@ -43,7 +43,7 @@ Single worker:
 nashium-worker --token YOUR_TOKEN
 ```
 
-Multiple workers (opens the per-worker tabbed console with `1`–`9` tab switching, **120s safe `Ctrl+C` drain**, and **`/kill`** instant force-kill):
+Multiple workers (opens the per-worker tabbed console with `1`–`9` tab switching, **120s safe `Ctrl+C` drain**, **`/kill`** instant force-kill, and a **final overview that stays open until you close it** — even after a crash — so you can always review what happened):
 
 ```bash
 nashium-worker --token YOUR_TOKEN --workers 6
@@ -74,6 +74,7 @@ nashium-worker --single --token YOUR_TOKEN
 - `--workers` — Number of worker processes to supervise (default: `1`)
 - `--shutdown-timeout` — Seconds to wait for in-flight matches on shutdown before force-killing (default: `120`)
 - `--tabs` / `--plain` / `--wt-tabs` — Force tabbed TUI, combined stream, or native Windows Terminal WSL2 tabs
+- `--auto-exit` — Close the tabbed console as soon as the last worker stops. Default is to keep the finished overview on screen until you close it with `q`, `Esc` or `Ctrl+C`, so errors can be reviewed
 - `--name` — Optional worker name shown in logs
 - `--rounds` — Number of rounds per match (default: `10000`)
 - `--max-time` — Max CPU time per bot in seconds (default: `100.0`)
@@ -89,6 +90,6 @@ nashium-worker --single --token YOUR_TOKEN
 ## Architecture
 
 - **`Worker` (`nashium.worker.runner`)** — Claims matches, runs them in Docker, caches completed results until submitted, and blocks/retries on harness faults without stranding or skipping matches
-- **`WorkerSupervisor` (`nashium.worker.supervisor`)** — Multi-worker launcher with staggered startup, per-worker log tabs, 120s graceful drain, and `/kill` instant force-kill + container reaper
+- **`WorkerSupervisor` (`nashium.worker.supervisor`)** — Multi-worker launcher with staggered startup, per-worker log tabs, 120s graceful drain, `/kill` instant force-kill + container reaper, and a session-end hold that keeps the final overview (states, exit codes, full logs) on screen until the operator closes it
 - **`NashiumClient` (`nashium.worker.client`)** — HTTP client for `/api/worker/claim-next` and `/api/worker/result`
 - **`DockerExecutor` (`nashium.server.docker`)** — Executes untrusted bot code in network-disabled, read-only, resource-capped Docker containers over Unix domain sockets

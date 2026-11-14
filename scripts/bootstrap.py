@@ -13,6 +13,10 @@ What this does:
        - Press 1-9 / Tab / Left / Right to switch worker tabs (0 for All)
        - Press Ctrl+C for a safe 120s drain (lets in-flight matches finish)
        - Type /kill + Enter to instantly force-kill all workers and reap containers
+       - When the last worker stops - including after a crash - the console does
+         NOT vanish: it freezes on the final overview so you can read what
+         happened. Press q / Esc / Ctrl+C to close it (--auto-exit restores the
+         old close-by-itself behaviour for unattended runs)
 
 Do NOT put workers inside Docker. Each worker runs on the host/WSL2 and talks
 to Docker to sandbox individual bot matches.
@@ -152,6 +156,15 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to let workers finish in-flight matches on Ctrl+C before force-kill (default: 120)",
     )
     p.add_argument(
+        "--auto-exit",
+        action="store_true",
+        help=(
+            "Close the tabbed console as soon as the last worker stops. By default the "
+            "overview stays on screen - including after a crash - until you close it with "
+            "q, Esc or Ctrl+C, so you can always review what happened"
+        ),
+    )
+    p.add_argument(
         "--log-level",
         default=os.environ.get("NASHIUM_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -251,6 +264,7 @@ def main() -> int:
         api_url=args.api_url,
         shutdown_timeout=args.shutdown_timeout,
         ui_mode=ui_mode,
+        auto_exit=args.auto_exit,
     )
 
 
